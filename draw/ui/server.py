@@ -158,7 +158,11 @@ class UIServer:
     # ------------------------------------------------------------------
 
     async def _push_loop(self) -> None:
+        import time as _time
         prev_mode: str = ""
+        last_ik_push: float = 0.0
+        IK_PUSH_INTERVAL = 1.0   # push IK grid and canvas dims once per second
+
         while True:
             await asyncio.sleep(0.033)   # ~30 fps
 
@@ -166,12 +170,23 @@ class UIServer:
             for ev in events:
                 await self._broadcast(ev)
 
-            # Broadcast mode if it changed (catches changes not triggered by
-            # state-machine listeners, e.g. direct transitions).
+            # Broadcast mode if it changed
             current_mode = self.controller.mode.name
             if current_mode != prev_mode:
                 await self._broadcast({"type": "mode", "data": current_mode})
                 prev_mode = current_mode
+
+            # Periodically push IK reachability grid and canvas dimensions
+            now = _time.monotonic()
+            if now - last_ik_push >= IK_PUSH_INTERVAL:
+                last_ik_push = now
+
+                dims = self.controller.get_canvas_dims()
+                await self._broadcast({"type": "canvas_dims", **dims})
+
+                ik_grid = self.controller.get_ik_grid(n=16)
+                if ik_grid is not None:
+                    await self._broadcast({"type": "ik_grid", "n": 16, "data": ik_grid})
 
     # ------------------------------------------------------------------
     # Broadcast helpers

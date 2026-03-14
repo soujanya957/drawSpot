@@ -31,54 +31,82 @@
 // Canvas setup
 // ---------------------------------------------------------------------------
 
-const CANVAS_PX = 600;     // desired canvas pixel size (square)
-const GRID_LINES = 10;     // number of grid divisions
+const CANVAS_MAX_PX = 600;   // max pixel dimension
+const GRID_LINES = 10;
 
 const drawCanvas = document.getElementById("draw-canvas");
 const ctx = drawCanvas.getContext("2d");
 
-// Make the canvas square, filling as much of the available area as possible
-// while keeping a fixed internal resolution.
-drawCanvas.width  = CANVAS_PX;
-drawCanvas.height = CANVAS_PX;
+// Physical canvas dimensions (updated from server)
+let canvasWidthMm  = 400;
+let canvasHeightMm = 400;
 
-// CSS responsive sizing (respects the flex container)
+// Internal canvas resolution (set once and reused)
+let CANVAS_W = CANVAS_MAX_PX;
+let CANVAS_H = CANVAS_MAX_PX;
+
+function applyCanvasDims(wMm, hMm) {
+  canvasWidthMm  = wMm;
+  canvasHeightMm = hMm;
+  const ratio = wMm / hMm;
+  if (ratio >= 1) {
+    CANVAS_W = CANVAS_MAX_PX;
+    CANVAS_H = Math.round(CANVAS_MAX_PX / ratio);
+  } else {
+    CANVAS_H = CANVAS_MAX_PX;
+    CANVAS_W = Math.round(CANVAS_MAX_PX * ratio);
+  }
+  drawCanvas.width  = CANVAS_W;
+  drawCanvas.height = CANVAS_H;
+  offscreen.width   = CANVAS_W;
+  offscreen.height  = CANVAS_H;
+  drawGrid();
+  resizeCanvas();
+}
+
+// CSS responsive sizing
 function resizeCanvas() {
-  const wrap = document.getElementById("canvas-wrap");
-  const sidebar = document.getElementById("sidebar");
-  const topbar  = document.getElementById("topbar");
-  const availW  = wrap.clientWidth  - 32;
-  const availH  = wrap.clientHeight - 32;
-  const side    = Math.min(availW, availH, CANVAS_PX);
-  drawCanvas.style.width  = side + "px";
-  drawCanvas.style.height = side + "px";
+  const wrap   = document.getElementById("canvas-wrap");
+  const availW = wrap.clientWidth  - 32;
+  const availH = wrap.clientHeight - 32;
+  const scaleW = availW / CANVAS_W;
+  const scaleH = availH / CANVAS_H;
+  const scale  = Math.min(scaleW, scaleH, 1);
+  drawCanvas.style.width  = Math.round(CANVAS_W * scale) + "px";
+  drawCanvas.style.height = Math.round(CANVAS_H * scale) + "px";
 }
 window.addEventListener("resize", resizeCanvas);
 resizeCanvas();
 
 // Offscreen canvas for persistent strokes
 const offscreen = document.createElement("canvas");
-offscreen.width  = CANVAS_PX;
-offscreen.height = CANVAS_PX;
+offscreen.width  = CANVAS_W;
+offscreen.height = CANVAS_H;
 const offCtx = offscreen.getContext("2d");
+
+// IK reachability grid (pushed from server once per second)
+let ikGrid    = null;   // flat bool array, row-major
+let ikGridN   = 0;      // grid dimension
+let showIk    = true;   // toggle via button
 
 // Draw grid on the offscreen canvas
 function drawGrid() {
   offCtx.fillStyle = "#ffffff";
-  offCtx.fillRect(0, 0, CANVAS_PX, CANVAS_PX);
+  offCtx.fillRect(0, 0, CANVAS_W, CANVAS_H);
 
   offCtx.strokeStyle = "#e8e8e8";
   offCtx.lineWidth = 0.5;
-  const step = CANVAS_PX / GRID_LINES;
+  const stepW = CANVAS_W / GRID_LINES;
+  const stepH = CANVAS_H / GRID_LINES;
   for (let i = 1; i < GRID_LINES; i++) {
     offCtx.beginPath();
-    offCtx.moveTo(i * step, 0);
-    offCtx.lineTo(i * step, CANVAS_PX);
+    offCtx.moveTo(i * stepW, 0);
+    offCtx.lineTo(i * stepW, CANVAS_H);
     offCtx.stroke();
 
     offCtx.beginPath();
-    offCtx.moveTo(0, i * step);
-    offCtx.lineTo(CANVAS_PX, i * step);
+    offCtx.moveTo(0, i * stepH);
+    offCtx.lineTo(CANVAS_W, i * stepH);
     offCtx.stroke();
   }
 
@@ -87,34 +115,52 @@ function drawGrid() {
   offCtx.font = "10px monospace";
   for (let i = 0; i <= GRID_LINES; i++) {
     const val = (i / GRID_LINES).toFixed(1);
-    offCtx.fillText(val, i * step + 2, CANVAS_PX - 4);
-    if (i > 0) offCtx.fillText(val, 2, i * step - 3);
+    offCtx.fillText(val, i * stepW + 2, CANVAS_H - 4);
+    if (i > 0) offCtx.fillText(val, 2, i * stepH - 3);
   }
 }
 drawGrid();
 
+// Draw IK reachability overlay onto a canvas context
+function drawIkOverlay(targetCtx) {
+  if (!ikGrid || !ikGridN || !showIk) return;
+  const n = ikGridN;
+  const cellW = CANVAS_W / n;
+  const cellH = CANVAS_H / n;
+  targetCtx.save();
+  for (let row = 0; row < n; row++) {
+    for (let col = 0; col < n; col++) {
+      const ok = ikGrid[row * n + col];
+      targetCtx.fillStyle = ok
+        ? "rgba(0, 200, 100, 0.18)"
+        : "rgba(220, 53, 69, 0.18)";
+      targetCtx.fillRect(col * cellW, row * cellH, cellW, cellH);
+    }
+  }
+  targetCtx.restore();
+}
+
 // Composite offscreen onto visible canvas
 function render() {
-  ctx.clearRect(0, 0, CANVAS_PX, CANVAS_PX);
+  ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
   ctx.drawImage(offscreen, 0, 0);
 
-  // Draw cursor crosshair (from latest known brush position)
+  // IK reachability overlay (semi-transparent, drawn over strokes)
+  drawIkOverlay(ctx);
+
+  // Cursor crosshair
   if (state.brushU !== null) {
-    const px = state.brushU * CANVAS_PX;
-    const py = state.brushV * CANVAS_PX;
+    const px = state.brushU * CANVAS_W;
+    const py = state.brushV * CANVAS_H;
     const radius = 6;
     const color = state.mode === "TELEOP" ? "#e63946" : "#457b9d";
 
     ctx.save();
     ctx.strokeStyle = color;
     ctx.lineWidth = 1.5;
-
-    // Circle
     ctx.beginPath();
     ctx.arc(px, py, radius, 0, Math.PI * 2);
     ctx.stroke();
-
-    // Crosshair lines
     ctx.beginPath();
     ctx.moveTo(px - radius * 1.8, py);
     ctx.lineTo(px + radius * 1.8, py);
@@ -152,8 +198,8 @@ function applyStroke(u, v, pen_down) {
   state.brushV = v;
   state.penDown = pen_down;
 
-  const px = u * CANVAS_PX;
-  const py = v * CANVAS_PX;
+  const px = u * CANVAS_W;
+  const py = v * CANVAS_H;
 
   if (pen_down) {
     if (prevPt) {
@@ -162,7 +208,7 @@ function applyStroke(u, v, pen_down) {
       offCtx.lineWidth   = 2;
       offCtx.lineCap     = "round";
       offCtx.lineJoin    = "round";
-      offCtx.moveTo(prevPt.u * CANVAS_PX, prevPt.v * CANVAS_PX);
+      offCtx.moveTo(prevPt.u * CANVAS_W, prevPt.v * CANVAS_H);
       offCtx.lineTo(px, py);
       offCtx.stroke();
       state.strokeCount++;
@@ -224,6 +270,15 @@ function connect() {
 
       case "vicon":
         applyViconStatus(msg);
+        break;
+
+      case "canvas_dims":
+        applyCanvasDims(msg.width_mm, msg.height_mm);
+        break;
+
+      case "ik_grid":
+        ikGrid  = msg.data;
+        ikGridN = msg.n;
         break;
     }
     render();
@@ -441,6 +496,11 @@ document.getElementById("btn-reset").addEventListener("click", () => {
   send({ type: "reset" });
 });
 
+document.getElementById("btn-ik").addEventListener("click", () => {
+  showIk = !showIk;
+  document.getElementById("btn-ik").textContent = showIk ? "🟢 Hide IK overlay" : "⬜ Show IK overlay";
+});
+
 document.getElementById("btn-clear").addEventListener("click", () => {
   send({ type: "clear" });
   drawGrid();
@@ -453,8 +513,8 @@ document.getElementById("btn-clear").addEventListener("click", () => {
 document.getElementById("btn-save").addEventListener("click", () => {
   // Composite grid + strokes (no cursor) for clean PNG export
   const exportCanvas = document.createElement("canvas");
-  exportCanvas.width  = CANVAS_PX;
-  exportCanvas.height = CANVAS_PX;
+  exportCanvas.width  = CANVAS_W;
+  exportCanvas.height = CANVAS_H;
   const expCtx = exportCanvas.getContext("2d");
   expCtx.drawImage(offscreen, 0, 0);
 
