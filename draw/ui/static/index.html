@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Spot Canvas Draw</title>
+  <style>
+    /* ------------------------------------------------------------------ reset */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: #1a1a2e;
+      color: #e0e0e0;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+      user-select: none;
+    }
+
+    /* ------------------------------------------------------------------ top bar */
+    #topbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 16px;
+      background: #16213e;
+      border-bottom: 1px solid #0f3460;
+      flex-shrink: 0;
+    }
+
+    #topbar h1 { font-size: 1rem; font-weight: 600; letter-spacing: .05em; }
+
+    #mode-badge {
+      padding: 3px 10px;
+      border-radius: 999px;
+      font-size: .78rem;
+      font-weight: 700;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      transition: background .25s, color .25s;
+    }
+    .mode-idle       { background: #444;   color: #ccc; }
+    .mode-autonomous { background: #0d6efd; color: #fff; }
+    .mode-teleop     { background: #198754; color: #fff; }
+    .mode-estop      { background: #dc3545; color: #fff; animation: pulse 0.6s ease infinite alternate; }
+
+    @keyframes pulse { from { opacity:1; } to { opacity:.6; } }
+
+    #connection-dot {
+      width: 10px; height: 10px; border-radius: 50%;
+      background: #6c757d; margin-left: auto; flex-shrink: 0;
+    }
+    #connection-dot.connected    { background: #20c997; }
+    #connection-dot.disconnected { background: #dc3545; }
+
+    /* ------------------------------------------------------------------ main area */
+    #main {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+      gap: 0;
+    }
+
+    /* ------------------------------------------------------------------ canvas panel */
+    #canvas-wrap {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      position: relative;
+    }
+
+    #canvas-bg {
+      position: relative;
+      box-shadow: 0 8px 32px rgba(0,0,0,.5);
+    }
+
+    #draw-canvas {
+      display: block;
+      background: #ffffff;
+      cursor: crosshair;
+    }
+
+    /* Canvas overlay for E-Stop flash */
+    #estop-overlay {
+      display: none;
+      position: absolute;
+      inset: 0;
+      background: rgba(220, 53, 69, .18);
+      pointer-events: none;
+      border: 4px solid #dc3545;
+    }
+
+    /* Hint shown when not in TELEOP and user hovers canvas */
+    #canvas-hint {
+      position: absolute;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0,0,0,.7);
+      color: #ffc107;
+      font-size: .8rem;
+      padding: 4px 12px;
+      border-radius: 4px;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity .2s;
+    }
+    #canvas-hint.visible { opacity: 1; }
+
+    /* ------------------------------------------------------------------ side panel */
+    #sidebar {
+      width: 220px;
+      flex-shrink: 0;
+      background: #16213e;
+      border-left: 1px solid #0f3460;
+      display: flex;
+      flex-direction: column;
+      padding: 16px 12px;
+      gap: 12px;
+      overflow-y: auto;
+    }
+
+    #sidebar h2 { font-size: .75rem; text-transform: uppercase; letter-spacing: .1em; color: #6c757d; margin-bottom: 4px; }
+
+    /* ------------------------------------------------------------------ buttons */
+    .btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 9px 14px;
+      border: none;
+      border-radius: 6px;
+      font-size: .85rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity .15s, transform .1s;
+      width: 100%;
+    }
+    .btn:active { transform: scale(.97); }
+    .btn:disabled { opacity: .4; cursor: not-allowed; }
+
+    .btn-estop    { background: #dc3545; color: #fff; font-size: 1rem; padding: 12px; }
+    .btn-takeover { background: #fd7e14; color: #fff; }
+    .btn-release  { background: #0d6efd; color: #fff; }
+    .btn-auto     { background: #0d6efd; color: #fff; }
+    .btn-reset    { background: #198754; color: #fff; }
+    .btn-clear    { background: #495057; color: #e0e0e0; }
+    .btn-save     { background: #6f42c1; color: #fff; }
+
+    /* ------------------------------------------------------------------ info box */
+    #info-box {
+      background: #0d1b2a;
+      border-radius: 6px;
+      padding: 10px 12px;
+      font-size: .78rem;
+      line-height: 1.7;
+      color: #adb5bd;
+    }
+    #info-box span { color: #e0e0e0; font-family: monospace; }
+
+    /* ------------------------------------------------------------------ stroke counter */
+    #stroke-count { font-size: .75rem; color: #6c757d; text-align: center; }
+
+    /* ------------------------------------------------------------------ vicon indicator */
+    #vicon-panel { display:flex; flex-direction:column; gap:6px; }
+    .vicon-row {
+      display: flex; align-items: center; gap: 8px;
+      font-size: .75rem; color: #adb5bd;
+    }
+    .vicon-dot {
+      width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+      background: #6c757d;
+    }
+    .vicon-dot.ok  { background: #20c997; }
+    .vicon-dot.bad { background: #dc3545; }
+
+  </style>
+</head>
+<body>
+
+<!-- ============================================================ top bar -->
+<div id="topbar">
+  <h1>&#129302; Spot Canvas Draw</h1>
+  <div id="mode-badge" class="mode-idle">IDLE</div>
+  <div style="margin-left:auto; display:flex; align-items:center; gap:6px; font-size:.75rem; color:#6c757d;">
+    WebSocket
+    <div id="connection-dot" class="disconnected"></div>
+  </div>
+</div>
+
+<!-- ============================================================ main area -->
+<div id="main">
+
+  <!-- canvas panel -->
+  <div id="canvas-wrap">
+    <div id="canvas-bg">
+      <canvas id="draw-canvas"></canvas>
+      <div id="estop-overlay"></div>
+    </div>
+    <div id="canvas-hint">Click &ldquo;Takeover&rdquo; to draw</div>
+  </div>
+
+  <!-- sidebar -->
+  <div id="sidebar">
+
+    <!-- emergency stop — always big and red -->
+    <div>
+      <h2>Emergency</h2>
+      <button class="btn btn-estop" id="btn-estop">&#9940; E-STOP</button>
+    </div>
+
+    <!-- operator control -->
+    <div>
+      <h2>Control</h2>
+      <button class="btn btn-takeover" id="btn-takeover" style="margin-bottom:6px">&#9881; Takeover</button>
+      <button class="btn btn-release"  id="btn-release"  style="margin-bottom:6px">&#9654; Release</button>
+      <button class="btn btn-auto"     id="btn-auto"     style="margin-bottom:6px">&#128257; Autonomous</button>
+      <button class="btn btn-reset"    id="btn-reset">&#9745; Reset E-Stop</button>
+    </div>
+
+    <!-- canvas actions -->
+    <div>
+      <h2>Canvas</h2>
+      <button class="btn btn-clear" id="btn-clear" style="margin-bottom:6px">&#128473; Clear</button>
+      <button class="btn btn-save"  id="btn-save">&#128190; Save PNG</button>
+    </div>
+
+    <!-- live info -->
+    <div>
+      <h2>Brush Position</h2>
+      <div id="info-box">
+        u: <span id="info-u">—</span><br/>
+        v: <span id="info-v">—</span><br/>
+        pen: <span id="info-pen">—</span>
+      </div>
+    </div>
+
+    <!-- Vicon object status -->
+    <div>
+      <h2>Vicon Objects</h2>
+      <div id="vicon-panel">
+        <div class="vicon-row"><div class="vicon-dot" id="dot-spot-body"></div> Spot body</div>
+        <div class="vicon-row"><div class="vicon-dot" id="dot-spot-ee"></div>   End-effector</div>
+        <div class="vicon-row"><div class="vicon-dot" id="dot-brush-tip"></div> Brush tip</div>
+        <div class="vicon-row"><div class="vicon-dot" id="dot-canvas"></div>    Canvas corners</div>
+      </div>
+    </div>
+
+    <div id="stroke-count">strokes: <span id="stroke-num">0</span></div>
+  </div>
+</div><!-- #main -->
+
+<script src="/static/app.js"></script>
+</body>
+</html>

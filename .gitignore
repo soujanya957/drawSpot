@@ -1,0 +1,15 @@
+# Credentials — never commit these
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Spot SDK (install separately via pip)
+spot-sdk/
+
+# OS
+.DS_Store
