@@ -25,6 +25,11 @@ ROBOT_IP = _require("SPOT_IP")
 USERNAME = _require("SPOT_USER")
 PASSWORD = _require("SPOT_PASSWORD")
 
+# --- Vicon DataStream Settings ---
+VICON_HOST = _require("VICON_HOST")
+VICON_PORT = int(os.environ.get("VICON_PORT", "801"))
+VICON_ADDRESS = f"{VICON_HOST}:{VICON_PORT}"
+
 # --- Arm / Motion Tuning ---
 ARM_VELOCITY_MAX = 0.5  # m/s, max end-effector cartesian speed
 BASE_VELOCITY_MAX = 0.5  # m/s, max base linear speed

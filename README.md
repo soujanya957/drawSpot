@@ -46,7 +46,8 @@ src/
     canvas_draw.py      # mouse-drag → arm draws on physical canvas
     pick_object.py      # click-to-grasp from hand camera
 
-  vicon/                # Vicon-driven positioning tests
+  vicon/                # Vicon-driven positioning and drawing
+    vicon_draw.py         # Full teleop + live Vicon status + canvas draw mode
     vicon_base_follow.py  # Vicon body displacement → base walks to match
     vicon_ee_follow.py    # Vicon marker position → arm end-effector follows
 ```
@@ -63,6 +64,13 @@ python -m draw.main --vicon 192.168.1.10:801
 **Manual teleop** (all controls):
 ```bash
 python -m src.teleop.full_control
+```
+
+**Vicon draw** (full teleop + live positions + canvas draw mode):
+```bash
+python -m src.vicon.vicon_draw --vicon 192.168.1.10:801
+# or without Vicon hardware:
+python -m src.vicon.vicon_draw --mock
 ```
 
 **Vicon EE follow test**:
