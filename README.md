@@ -8,12 +8,17 @@ Spot robot draws on a canvas guided by Vicon motion capture.
 pip install bosdyn-client bosdyn-mission bosdyn-api opencv-python pygame
 ```
 
-Copy `.env.example` to `.env` and fill in your robot's credentials:
+Copy `.env.example` to `.env` and fill in your credentials:
 
 ```bash
 cp .env.example .env
-# edit .env
+# edit .env with your SPOT_IP, SPOT_USER, SPOT_PASSWORD, VICON_HOST, VICON_PORT
 export $(cat .env | xargs)
+```
+
+Or use [direnv](https://direnv.net/) to load automatically on `cd`:
+```bash
+echo 'dotenv' > .envrc && direnv allow
 ```
 
 ---
@@ -68,10 +73,16 @@ python -m src.teleop.full_control
 
 **Vicon draw** (full teleop + live positions + canvas draw mode):
 ```bash
-python -m src.vicon.vicon_draw --vicon 192.168.1.10:801
-# or without Vicon hardware:
+python -m src.vicon.vicon_draw
+# override Vicon address:
+python -m src.vicon.vicon_draw --vicon 192.168.10.1:801
+# without Vicon hardware (mock):
 python -m src.vicon.vicon_draw --mock
 ```
+
+Connects to Spot first, then tries Vicon (5 s timeout). If Vicon is unavailable or
+`VICON_HOST` is not set, the script continues in teleop-only mode — draw mode (`d` key)
+is disabled until Vicon data arrives.
 
 **Vicon EE follow test**:
 ```bash
