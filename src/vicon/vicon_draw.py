@@ -93,6 +93,8 @@ HAND_COLOR_SOURCE = "hand_color_image"
 STATUS_INTERVAL   = 0.5
 WEB_PORT          = 8080
 IK_GRID_N         = 16
+MOTION_HZ         = 20      # arm command rate
+MAX_ARM_UV_SPEED  = 0.20    # canvas UV/s ≈ 80 mm/s on a 400 mm canvas
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -461,6 +463,9 @@ class DrawServer:
         self._cmd    = cmd_client
         self._vicon  = vicon_client
         self._clients: Set[WebSocket] = set()
+        # Latest target received from browser (canvas UV, updated by WS handler)
+        self._target_uv:  Optional[tuple] = None
+        self._target_pen: bool            = False
         self._app    = self._build_app()
         self._thread: Optional[threading.Thread] = None
 
@@ -506,29 +511,52 @@ class DrawServer:
     async def _handle(self, msg: dict):
         t = msg.get("type")
         if t == "move":
-            frame = _latest_frame(self._vicon)
-            _send_draw_command(
-                self._cmd, frame,
-                float(msg.get("u", 0.5)),
-                float(msg.get("v", 0.5)),
-                bool(msg.get("pen_down", True)),
-            )
+            # Store target only — motion loop sends arm commands at controlled rate
+            self._target_uv  = (float(msg.get("u", 0.5)), float(msg.get("v", 0.5)))
+            self._target_pen = bool(msg.get("pen_down", True))
         elif t == "estop":
             emergency_stop(self._cmd)
 
     async def _push_loop(self):
-        import time as _t
-        last = 0.0
+        """
+        Runs at MOTION_HZ (20 Hz).
+        - Smoothly interpolates arm toward latest target UV at MAX_ARM_UV_SPEED.
+        - Pushes IK grid + canvas dims to browsers once per second.
+        """
+        _tick     = 1.0 / MOTION_HZ
+        _max_step = MAX_ARM_UV_SPEED * _tick
+
+        last_ik = 0.0
+        cur_u, cur_v = 0.5, 0.5
+
+        ev_loop = asyncio.get_event_loop()
         while True:
-            await asyncio.sleep(0.033)
-            now = _t.monotonic()
-            if now - last >= 1.0:
-                last = now
+            t0 = ev_loop.time()
+
+            # ── Smooth arm motion ─────────────────────────────────────────
+            if self._target_uv is not None:
+                tu, tv = self._target_uv
+                du, dv = tu - cur_u, tv - cur_v
+                dist = math.sqrt(du * du + dv * dv)
+                if dist > 1e-6:
+                    step   = min(dist, _max_step)
+                    cur_u += (du / dist) * step
+                    cur_v += (dv / dist) * step
+                frame = _latest_frame(self._vicon)
+                _send_draw_command(self._cmd, frame, cur_u, cur_v, self._target_pen)
+
+            # ── IK grid + canvas dims (every 1 s) ────────────────────────
+            now = ev_loop.time()
+            if now - last_ik >= 1.0:
+                last_ik = now
                 frame = _latest_frame(self._vicon)
                 ik = _compute_ik_grid(frame)
                 if ik:
                     await self._broadcast({"type": "ik_grid", "n": IK_GRID_N, "data": ik})
                 await self._broadcast({"type": "canvas_dims", **_get_canvas_dims(frame)})
+
+            elapsed = ev_loop.time() - t0
+            await asyncio.sleep(max(0.001, _tick - elapsed))
 
     async def _broadcast(self, msg: dict):
         dead = set()

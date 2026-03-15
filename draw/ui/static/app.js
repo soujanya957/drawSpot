@@ -436,66 +436,45 @@ function mouseDisplayUV(evt) {
   };
 }
 
-// Throttle: only send if display-UV position changed by more than this.
-const SEND_THRESHOLD = 0.002;
+// ---------------------------------------------------------------------------
+// Smooth cursor state
+// MAX_CURSOR_SPEED — how fast the on-screen cursor (and arm target) can move.
+// While hovering (no button held) the cursor snaps directly to the mouse so
+// the pointer feels immediate.  Once the button goes down the cursor smoothly
+// interpolates, capping the speed sent to the robot.
+// ---------------------------------------------------------------------------
 
-function shouldSend(u_d, v_d) {
-  if (state.lastMouseU === null) return true;
-  const du = u_d - state.lastMouseU;
-  const dv = v_d - state.lastMouseV;
-  return Math.sqrt(du*du + dv*dv) >= SEND_THRESHOLD;
-}
+let _cursorU = 0.5, _cursorV = 0.5;     // smoothed display UV (drives arm)
+let _mouseTargetU = null, _mouseTargetV = null;  // raw mouse in display UV
+let _lastFrameMs = null;
+let _lastSendMs  = 0;
+const MAX_CURSOR_SPEED = 0.35;   // display UV / second while dragging
+const MIN_SEND_MS      = 33;     // throttle WS sends to ~30 / s
 
 drawCanvas.addEventListener("mousemove", (evt) => {
-  if (state.mode !== "TELEOP") return;
   const {u_d, v_d} = mouseDisplayUV(evt);
-  state.brushU = u_d;
-  state.brushV = v_d;
-
-  if (state.mouseDown && shouldSend(u_d, v_d)) {
-    const [u_c, v_c] = displayToCanvasUV(u_d, v_d);
-    send({ type: "move", u: u_c, v: v_c, pen_down: true });
-    state.lastMouseU = u_d;
-    state.lastMouseV = v_d;
-  }
-  render();
+  _mouseTargetU = u_d;
+  _mouseTargetV = v_d;
 });
 
 drawCanvas.addEventListener("mousedown", (evt) => {
-  if (evt.button !== 0) return;
-  if (state.mode !== "TELEOP") return;
+  if (evt.button !== 0 || state.mode !== "TELEOP") return;
   state.mouseDown = true;
-  const {u_d, v_d} = mouseDisplayUV(evt);
-  const [u_c, v_c] = displayToCanvasUV(u_d, v_d);
-  send({ type: "move", u: u_c, v: v_c, pen_down: true });
-  state.lastMouseU = u_d;
-  state.lastMouseV = v_d;
-  render();
+  prevPt = null;   // start a fresh stroke segment
 });
 
-drawCanvas.addEventListener("mouseup", () => {
+function _penUp() {
   if (!state.mouseDown) return;
-  state.mouseDown  = false;
-  state.lastMouseU = null;
-  state.lastMouseV = null;
-  if (state.mode === "TELEOP" && state.brushU !== null) {
-    const [u_c, v_c] = displayToCanvasUV(state.brushU, state.brushV);
+  state.mouseDown = false;
+  prevPt = null;
+  if (state.mode === "TELEOP") {
+    const [u_c, v_c] = displayToCanvasUV(_cursorU, _cursorV);
     send({ type: "move", u: u_c, v: v_c, pen_down: false });
+    document.getElementById("info-pen").textContent = "UP";
   }
-});
-
-// Cancel drag if mouse leaves the window
-window.addEventListener("mouseup", () => {
-  if (state.mouseDown) {
-    state.mouseDown  = false;
-    state.lastMouseU = null;
-    state.lastMouseV = null;
-    if (state.mode === "TELEOP" && state.brushU !== null) {
-      const [u_c, v_c] = displayToCanvasUV(state.brushU, state.brushV);
-      send({ type: "move", u: u_c, v: v_c, pen_down: false });
-    }
-  }
-});
+}
+drawCanvas.addEventListener("mouseup",    _penUp);
+window.addEventListener("mouseup",        _penUp);
 
 drawCanvas.addEventListener("mouseleave", () => {
   updateCanvasHint();
@@ -507,31 +486,22 @@ drawCanvas.addEventListener("mouseenter", () => {
   }
 });
 
-// Touch support (basic)
+// Touch support
 drawCanvas.addEventListener("touchmove", (evt) => {
   evt.preventDefault();
   if (state.mode !== "TELEOP") return;
-  const touch = evt.touches[0];
-  const {u_d, v_d} = mouseDisplayUV(touch);
-  if (shouldSend(u_d, v_d)) {
-    const [u_c, v_c] = displayToCanvasUV(u_d, v_d);
-    send({ type: "move", u: u_c, v: v_c, pen_down: true });
-    state.lastMouseU = u_d;
-    state.lastMouseV = v_d;
-  }
-  state.brushU = u_d;
-  state.brushV = v_d;
-  render();
+  const {u_d, v_d} = mouseDisplayUV(evt.touches[0]);
+  _mouseTargetU = u_d;
+  _mouseTargetV = v_d;
 }, { passive: false });
 
-drawCanvas.addEventListener("touchend", () => {
-  if (state.mode === "TELEOP" && state.brushU !== null) {
-    const [u_c, v_c] = displayToCanvasUV(state.brushU, state.brushV);
-    send({ type: "move", u: u_c, v: v_c, pen_down: false });
-  }
-  state.lastMouseU = null;
-  state.lastMouseV = null;
-});
+drawCanvas.addEventListener("touchstart", (evt) => {
+  if (state.mode !== "TELEOP") return;
+  state.mouseDown = true;
+  prevPt = null;
+}, { passive: true });
+
+drawCanvas.addEventListener("touchend", _penUp);
 
 // ---------------------------------------------------------------------------
 // Button wiring
@@ -609,10 +579,70 @@ window.addEventListener("keydown", (evt) => {
 });
 
 // ---------------------------------------------------------------------------
-// Render loop (cursor animation even without new server data)
+// Animation loop — runs at ~60 fps (requestAnimationFrame).
+// Moves the on-screen cursor toward the mouse, draws strokes locally,
+// and sends arm target to the server at ~30 msgs/s when dragging.
+// The robot arm follows on the server side at 20 Hz (MAX_ARM_UV_SPEED).
 // ---------------------------------------------------------------------------
 
-function loop() {
+function loop(now) {
+  if (_lastFrameMs !== null && _mouseTargetU !== null) {
+    const dt = Math.min((now - _lastFrameMs) / 1000, 0.1);
+
+    if (state.mouseDown) {
+      // While dragging: smooth interpolation caps how fast target moves
+      const du = _mouseTargetU - _cursorU;
+      const dv = _mouseTargetV - _cursorV;
+      const dist = Math.sqrt(du * du + dv * dv);
+      if (dist > 0) {
+        const step = Math.min(dist, MAX_CURSOR_SPEED * dt);
+        _cursorU += (du / dist) * step;
+        _cursorV += (dv / dist) * step;
+      }
+    } else {
+      // While hovering (no button): cursor snaps directly to mouse
+      _cursorU = _mouseTargetU;
+      _cursorV = _mouseTargetV;
+    }
+
+    state.brushU = _cursorU;
+    state.brushV = _cursorV;
+
+    // Draw stroke locally and send to server while dragging
+    if (state.mouseDown && state.mode === "TELEOP") {
+      const px = _cursorU * CANVAS_W;
+      const py = _cursorV * CANVAS_H;
+      if (prevPt) {
+        offCtx.beginPath();
+        offCtx.strokeStyle = "#1a1a1a";
+        offCtx.lineWidth   = 2;
+        offCtx.lineCap     = "round";
+        offCtx.lineJoin    = "round";
+        offCtx.moveTo(prevPt.u * CANVAS_W, prevPt.v * CANVAS_H);
+        offCtx.lineTo(px, py);
+        offCtx.stroke();
+        state.strokeCount++;
+        document.getElementById("stroke-num").textContent = state.strokeCount;
+      } else {
+        offCtx.beginPath();
+        offCtx.fillStyle = "#1a1a1a";
+        offCtx.arc(px, py, 1.5, 0, Math.PI * 2);
+        offCtx.fill();
+      }
+      prevPt = { u: _cursorU, v: _cursorV };
+
+      if (now - _lastSendMs >= MIN_SEND_MS) {
+        const [u_c, v_c] = displayToCanvasUV(_cursorU, _cursorV);
+        send({ type: "move", u: u_c, v: v_c, pen_down: true });
+        document.getElementById("info-u").textContent   = u_c.toFixed(4);
+        document.getElementById("info-v").textContent   = v_c.toFixed(4);
+        document.getElementById("info-pen").textContent = "DOWN";
+        _lastSendMs = now;
+      }
+    }
+  }
+
+  _lastFrameMs = now;
   render();
   requestAnimationFrame(loop);
 }
