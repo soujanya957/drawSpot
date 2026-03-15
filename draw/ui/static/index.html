@@ -5,13 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Spot Canvas Draw</title>
   <style>
-    /* ------------------------------------------------------------------ reset */
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
     body {
-      font-family: 'Segoe UI', system-ui, sans-serif;
-      background: #1a1a2e;
-      color: #e0e0e0;
+      font-family: 'Courier New', monospace;
+      background: #111;
+      color: #ccc;
       display: flex;
       flex-direction: column;
       height: 100vh;
@@ -19,177 +18,158 @@
       user-select: none;
     }
 
-    /* ------------------------------------------------------------------ top bar */
     #topbar {
       display: flex;
       align-items: center;
       gap: 12px;
-      padding: 10px 16px;
-      background: #16213e;
-      border-bottom: 1px solid #0f3460;
+      padding: 8px 16px;
+      background: #000;
+      border-bottom: 1px solid #333;
       flex-shrink: 0;
     }
 
-    #topbar h1 { font-size: 1rem; font-weight: 600; letter-spacing: .05em; }
+    #topbar h1 { font-size: .85rem; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: #fff; }
 
     #mode-badge {
-      padding: 3px 10px;
-      border-radius: 999px;
-      font-size: .78rem;
+      padding: 2px 8px;
+      font-size: .75rem;
       font-weight: 700;
-      letter-spacing: .08em;
+      letter-spacing: .1em;
       text-transform: uppercase;
-      transition: background .25s, color .25s;
+      border: 1px solid #555;
+      color: #ccc;
     }
-    .mode-idle       { background: #444;   color: #ccc; }
-    .mode-autonomous { background: #0d6efd; color: #fff; }
-    .mode-teleop     { background: #198754; color: #fff; }
-    .mode-estop      { background: #dc3545; color: #fff; animation: pulse 0.6s ease infinite alternate; }
+    .mode-idle       { border-color: #444; color: #666; }
+    .mode-autonomous { border-color: #aaa; color: #fff; }
+    .mode-teleop     { border-color: #fff; color: #fff; background: #fff; color: #000; }
+    .mode-estop      { border-color: #fff; color: #fff; background: #000; animation: blink .5s step-end infinite; }
 
-    @keyframes pulse { from { opacity:1; } to { opacity:.6; } }
+    @keyframes blink { 50% { background: #fff; color: #000; } }
 
     #connection-dot {
-      width: 10px; height: 10px; border-radius: 50%;
-      background: #6c757d; margin-left: auto; flex-shrink: 0;
+      width: 8px; height: 8px; border-radius: 50%;
+      background: #333; margin-left: auto; flex-shrink: 0;
     }
-    #connection-dot.connected    { background: #20c997; }
-    #connection-dot.disconnected { background: #dc3545; }
+    #connection-dot.connected    { background: #aaa; }
+    #connection-dot.disconnected { background: #555; }
 
-    /* ------------------------------------------------------------------ main area */
-    #main {
-      display: flex;
-      flex: 1;
-      overflow: hidden;
-      gap: 0;
-    }
+    #main { display: flex; flex: 1; overflow: hidden; }
 
-    /* ------------------------------------------------------------------ canvas panel */
     #canvas-wrap {
       flex: 1;
       display: flex;
       align-items: center;
       justify-content: center;
-      padding: 16px;
+      padding: 20px;
+      background: #111;
       position: relative;
     }
 
-    #canvas-bg {
-      position: relative;
-      box-shadow: 0 8px 32px rgba(0,0,0,.5);
-    }
+    #canvas-bg { position: relative; }
 
     #draw-canvas {
       display: block;
-      background: #ffffff;
+      background: #fff;
       cursor: crosshair;
+      border: 1px solid #444;
     }
 
-    /* Canvas overlay for E-Stop flash */
     #estop-overlay {
       display: none;
       position: absolute;
       inset: 0;
-      background: rgba(220, 53, 69, .18);
+      background: rgba(255,255,255,.08);
       pointer-events: none;
-      border: 4px solid #dc3545;
+      border: 3px solid #fff;
     }
 
-    /* Hint shown when not in TELEOP and user hovers canvas */
     #canvas-hint {
       position: absolute;
-      bottom: 24px;
+      bottom: 28px;
       left: 50%;
       transform: translateX(-50%);
-      background: rgba(0,0,0,.7);
-      color: #ffc107;
-      font-size: .8rem;
-      padding: 4px 12px;
-      border-radius: 4px;
+      background: #000;
+      border: 1px solid #444;
+      color: #888;
+      font-size: .75rem;
+      padding: 3px 10px;
       pointer-events: none;
       opacity: 0;
-      transition: opacity .2s;
+      transition: opacity .15s;
+      white-space: nowrap;
     }
     #canvas-hint.visible { opacity: 1; }
 
-    /* ------------------------------------------------------------------ side panel */
     #sidebar {
-      width: 220px;
+      width: 200px;
       flex-shrink: 0;
-      background: #16213e;
-      border-left: 1px solid #0f3460;
+      background: #000;
+      border-left: 1px solid #333;
       display: flex;
       flex-direction: column;
-      padding: 16px 12px;
-      gap: 12px;
+      padding: 12px 10px;
+      gap: 14px;
       overflow-y: auto;
     }
 
-    #sidebar h2 { font-size: .75rem; text-transform: uppercase; letter-spacing: .1em; color: #6c757d; margin-bottom: 4px; }
+    #sidebar h2 {
+      font-size: .65rem;
+      text-transform: uppercase;
+      letter-spacing: .12em;
+      color: #555;
+      margin-bottom: 5px;
+      border-bottom: 1px solid #222;
+      padding-bottom: 3px;
+    }
 
-    /* ------------------------------------------------------------------ buttons */
     .btn {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 6px;
-      padding: 9px 14px;
-      border: none;
-      border-radius: 6px;
-      font-size: .85rem;
-      font-weight: 600;
-      cursor: pointer;
-      transition: opacity .15s, transform .1s;
+      display: block;
       width: 100%;
-    }
-    .btn:active { transform: scale(.97); }
-    .btn:disabled { opacity: .4; cursor: not-allowed; }
-
-    .btn-estop    { background: #dc3545; color: #fff; font-size: 1rem; padding: 12px; }
-    .btn-takeover { background: #fd7e14; color: #fff; }
-    .btn-release  { background: #0d6efd; color: #fff; }
-    .btn-auto     { background: #0d6efd; color: #fff; }
-    .btn-reset    { background: #198754; color: #fff; }
-    .btn-clear    { background: #495057; color: #e0e0e0; }
-    .btn-save     { background: #6f42c1; color: #fff; }
-    .btn-ik       { background: #1a6632; color: #fff; font-size: .8rem; }
-
-    /* ------------------------------------------------------------------ info box */
-    #info-box {
-      background: #0d1b2a;
-      border-radius: 6px;
-      padding: 10px 12px;
+      padding: 7px 10px;
+      margin-bottom: 4px;
+      background: #111;
+      color: #bbb;
+      border: 1px solid #333;
+      font-family: inherit;
       font-size: .78rem;
-      line-height: 1.7;
-      color: #adb5bd;
+      font-weight: 600;
+      letter-spacing: .05em;
+      text-transform: uppercase;
+      cursor: pointer;
+      text-align: left;
     }
-    #info-box span { color: #e0e0e0; font-family: monospace; }
+    .btn:last-child { margin-bottom: 0; }
+    .btn:hover:not(:disabled) { background: #222; color: #fff; border-color: #666; }
+    .btn:active:not(:disabled) { background: #fff; color: #000; }
+    .btn:disabled { opacity: .3; cursor: not-allowed; }
 
-    /* ------------------------------------------------------------------ stroke counter */
-    #stroke-count { font-size: .75rem; color: #6c757d; text-align: center; }
+    .btn-estop { border-color: #888; color: #fff; font-size: .82rem; padding: 10px; }
+    .btn-estop:hover:not(:disabled) { background: #fff; color: #000; border-color: #fff; }
 
-    /* ------------------------------------------------------------------ vicon indicator */
-    #vicon-panel { display:flex; flex-direction:column; gap:6px; }
-    .vicon-row {
-      display: flex; align-items: center; gap: 8px;
-      font-size: .75rem; color: #adb5bd;
+    #info-box {
+      font-size: .75rem;
+      line-height: 1.9;
+      color: #555;
     }
-    .vicon-dot {
-      width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
-      background: #6c757d;
-    }
-    .vicon-dot.ok  { background: #20c997; }
-    .vicon-dot.bad { background: #dc3545; }
+    #info-box span { color: #ccc; }
 
+    #stroke-count { font-size: .7rem; color: #444; }
+
+    #vicon-panel { display: flex; flex-direction: column; gap: 5px; }
+    .vicon-row { display: flex; align-items: center; gap: 7px; font-size: .72rem; color: #555; }
+    .vicon-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; background: #333; }
+    .vicon-dot.ok  { background: #aaa; }
+    .vicon-dot.bad { background: #555; }
   </style>
 </head>
 <body>
 
 <!-- ============================================================ top bar -->
 <div id="topbar">
-  <h1>&#129302; Spot Canvas Draw</h1>
+  <h1>Spot Canvas Draw</h1>
   <div id="mode-badge" class="mode-idle">IDLE</div>
-  <div style="margin-left:auto; display:flex; align-items:center; gap:6px; font-size:.75rem; color:#6c757d;">
-    WebSocket
+  <div style="margin-left:auto; display:flex; align-items:center; gap:6px; font-size:.7rem; color:#444;">
+    WS
     <div id="connection-dot" class="disconnected"></div>
   </div>
 </div>
@@ -212,24 +192,24 @@
     <!-- emergency stop — always big and red -->
     <div>
       <h2>Emergency</h2>
-      <button class="btn btn-estop" id="btn-estop">&#9940; E-STOP</button>
+      <button class="btn btn-estop" id="btn-estop">E-STOP</button>
     </div>
 
     <!-- operator control -->
     <div>
       <h2>Control</h2>
-      <button class="btn btn-takeover" id="btn-takeover" style="margin-bottom:6px">&#9881; Takeover</button>
-      <button class="btn btn-release"  id="btn-release"  style="margin-bottom:6px">&#9654; Release</button>
-      <button class="btn btn-auto"     id="btn-auto"     style="margin-bottom:6px">&#128257; Autonomous</button>
-      <button class="btn btn-reset"    id="btn-reset">&#9745; Reset E-Stop</button>
+      <button class="btn" id="btn-takeover">Takeover</button>
+      <button class="btn" id="btn-release">Release</button>
+      <button class="btn" id="btn-auto">Autonomous</button>
+      <button class="btn" id="btn-reset">Reset E-Stop</button>
     </div>
 
     <!-- canvas actions -->
     <div>
       <h2>Canvas</h2>
-      <button class="btn btn-clear" id="btn-clear" style="margin-bottom:6px">&#128473; Clear</button>
-      <button class="btn btn-save"  id="btn-save"  style="margin-bottom:6px">&#128190; Save PNG</button>
-      <button class="btn btn-ik"    id="btn-ik">&#129001; Hide IK overlay</button>
+      <button class="btn" id="btn-clear">Clear</button>
+      <button class="btn" id="btn-save">Save PNG</button>
+      <button class="btn" id="btn-ik">Hide IK overlay</button>
     </div>
 
     <!-- live info -->

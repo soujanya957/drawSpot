@@ -1,43 +1,60 @@
 """
-Vicon Draw
-==========
-Full teleop (base + arm + gripper + pick) with live Vicon position status
-and a canvas draw mode where the arm follows a UV target on the physical canvas.
+Spot Draw
+=========
+Two-phase unified controller.
 
-Modes
------
-  (default)  BASE only  — WASD/QE move the base
-  TAB        ARM mode   — IJKL/UO/RTFGYH control arm in body frame
-  b          DRAW mode  — IJKL move a UV target on canvas; arm follows
+Phase 1 — TELEOP  (terminal)
+  Walk the robot to the brush, pick it up, walk to canvas.
+  Same controls as full_control.py.
 
-Draw mode
----------
-  i / k      canvas -V / +V  (forward / back along canvas height axis)
-  j / l      canvas -U / +U  (left / right along canvas width axis)
-  [          pen DOWN  (gripper at BRUSH_LENGTH_MM above canvas surface)
-  ]          pen UP    (gripper lifted an extra PEN_UP_EXTRA_MM above that)
+  Key       Action
+  ──────────────────────────────────────────
+  w/s/a/d   base forward / back / strafe
+  q/e       base yaw left / right
+  SPACE     stop base
+  TAB       toggle arm mode (IJKL UO RPY)
+  [ / ]     gripper open / close
+  z         stow arm
+  n         pick object from hand camera
+  d         enter draw pose → launch web UI
+  ESC       emergency stop (stop + stow + sit)
+  x         exit
 
-  The arm is commanded in the odom frame using the Vicon canvas geometry.
-  If the UV target is outside the arm's workspace the command is skipped
-  and the reachable UV bounding box is printed instead.
-
-Outside draw mode, [ / ] open / close the gripper as usual.
+Phase 2 — DRAW  (web UI at http://localhost:8080)
+  Arm moves to the draw pose above the canvas center.
+  Browser canvas controls the brush:
+    mouse click + hold  → pen down, arm follows in 2D
+    mouse release       → pen up
+    IK overlay          → green = reachable, red = out of range
+  Terminal: press ESC to exit draw mode and return to teleop.
 
 Run:
+    python -m src.vicon.vicon_draw                  # uses VICON_ADDRESS from .env
     python -m src.vicon.vicon_draw --vicon HOST:PORT
-    python -m src.vicon.vicon_draw --mock          # no Vicon hardware
+    python -m src.vicon.vicon_draw --mock
 """
 
 import argparse
+import asyncio
+import json
 import math
+import os
 import select
 import sys
 import termios
+import threading
 import time
 import tty
+from contextlib import asynccontextmanager
+from typing import Optional, Set
 
 import cv2
 import numpy as np
+import uvicorn
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from google.protobuf import duration_pb2
 
 import bosdyn.client
 import bosdyn.client.util
@@ -49,39 +66,37 @@ from bosdyn.client.image import ImageClient, build_image_request
 from bosdyn.client.lease import LeaseClient, LeaseKeepAlive
 from bosdyn.client.manipulation_api_client import ManipulationApiClient
 from bosdyn.client.robot_command import RobotCommandBuilder, RobotCommandClient, blocking_stand
-from google.protobuf import duration_pb2
 
 sys.path.insert(0, __file__.split("/src/")[0])
 from config.robot_config import (
     BASE_ROTATION_MAX, BASE_VELOCITY_MAX,
-    PASSWORD, ROBOT_IP, USERNAME,
-    VICON_ADDRESS,
+    PASSWORD, ROBOT_IP, USERNAME, VICON_ADDRESS,
 )
 from draw.vicon.client import MockViconClient, ViconClient
 from draw.vicon.transform import canvas_to_world, clamp_uv
+
+_REPO_ROOT  = __file__.split("/src/")[0]
+_STATIC_DIR = os.path.join(_REPO_ROOT, "draw", "ui", "static")
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-BRUSH_LENGTH_MM  = 150.0        # brush extends this far below gripper tip
-PEN_UP_EXTRA_MM  =  60.0        # extra lift when pen is raised
-DRAW_STEP_UV     =   0.02       # UV step per keypress in draw mode
-
-ARM_REACH_MAX_M  = 0.85
-ARM_REACH_MIN_M  = 0.15
-
-BASE_CMD_DUR     = 0.5          # seconds velocity command stays active
-ARM_STEP_POS     = 0.02         # metres per arm key press
-ARM_STEP_ROT     = math.radians(3)
-
+BRUSH_LENGTH_MM   = 150.0   # brush extends this far below gripper tip
+PEN_UP_EXTRA_MM   =  60.0   # extra clearance when pen is raised
+ARM_REACH_MAX_M   = 0.85
+ARM_REACH_MIN_M   = 0.15
+BASE_CMD_DUR      = 0.5
+ARM_STEP_POS      = 0.02
+ARM_STEP_ROT      = math.radians(3)
 HAND_COLOR_SOURCE = "hand_color_image"
-STATUS_INTERVAL   = 0.5         # seconds between status prints
+STATUS_INTERVAL   = 0.5
+WEB_PORT          = 8080
+IK_GRID_N         = 16
 
 # ---------------------------------------------------------------------------
-# Low-level helpers
+# Helpers
 # ---------------------------------------------------------------------------
-
 
 def _dur(secs):
     return duration_pb2.Duration(seconds=int(secs), nanos=int((secs - int(secs)) * 1e9))
@@ -92,39 +107,28 @@ def _rpy_to_quat(roll, pitch, yaw):
     cp, sp = math.cos(pitch / 2), math.sin(pitch / 2)
     cy, sy = math.cos(yaw / 2), math.sin(yaw / 2)
     return Quaternion(
-        w=cr * cp * cy + sr * sp * sy,
-        x=sr * cp * cy - cr * sp * sy,
-        y=cr * sp * cy + sr * cp * sy,
-        z=cr * cp * sy - sr * sp * cy,
+        w=cr*cp*cy + sr*sp*sy, x=sr*cp*cy - cr*sp*sy,
+        y=cr*sp*cy + sr*cp*sy, z=cr*cp*sy - sr*sp*cy,
     )
 
 
-def _rotation_matrix_from_quat(q):
+def _rotation_matrix(q):
     qx, qy, qz, qw = q
     return np.array([
-        [1 - 2*(qy**2 + qz**2),     2*(qx*qy - qz*qw),     2*(qx*qz + qy*qw)],
-        [    2*(qx*qy + qz*qw), 1 - 2*(qx**2 + qz**2),     2*(qy*qz - qx*qw)],
-        [    2*(qx*qz - qy*qw),     2*(qy*qz + qx*qw), 1 - 2*(qx**2 + qy**2)],
+        [1-2*(qy**2+qz**2),   2*(qx*qy-qz*qw),   2*(qx*qz+qy*qw)],
+        [  2*(qx*qy+qz*qw), 1-2*(qx**2+qz**2),   2*(qy*qz-qx*qw)],
+        [  2*(qx*qz-qy*qw),   2*(qy*qz+qx*qw), 1-2*(qx**2+qy**2)],
     ], dtype=float)
 
 
 def _world_to_body(target_mm, body_pos_mm, body_quat):
-    """Vicon world-frame position (mm) → Spot body frame (m)."""
-    R = _rotation_matrix_from_quat(body_quat)
-    body_mm = R.T @ (target_mm - body_pos_mm)
-    return body_mm / 1000.0
+    R = _rotation_matrix(body_quat)
+    return R.T @ (target_mm - body_pos_mm) / 1000.0
 
 
-def _check_reach(pos_body_m):
-    """Returns (ok: bool, reason: str)."""
-    dist = float(np.linalg.norm(pos_body_m))
-    if dist > ARM_REACH_MAX_M:
-        return False, f"too far ({dist:.3f} m > {ARM_REACH_MAX_M} m)"
-    if dist < ARM_REACH_MIN_M:
-        return False, f"too close ({dist:.3f} m < {ARM_REACH_MIN_M} m)"
-    if pos_body_m[0] < 0.0:
-        return False, f"behind body (x={pos_body_m[0]:.3f} m)"
-    return True, "ok"
+def _reachable(pos_body_m):
+    d = float(np.linalg.norm(pos_body_m))
+    return ARM_REACH_MIN_M <= d <= ARM_REACH_MAX_M and pos_body_m[0] >= 0.0
 
 
 def _get_key(timeout=0.05):
@@ -132,63 +136,109 @@ def _get_key(timeout=0.05):
     old = termios.tcgetattr(fd)
     try:
         tty.setraw(fd)
-        rlist, _, _ = select.select([sys.stdin], [], [], timeout)
-        if rlist:
-            return sys.stdin.read(1)
-        return None
+        r, _, _ = select.select([sys.stdin], [], [], timeout)
+        return sys.stdin.read(1) if r else None
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
+# ---------------------------------------------------------------------------
+# Vicon / IK helpers
+# ---------------------------------------------------------------------------
+
+def _compute_ik_grid(frame, n=IK_GRID_N):
+    if frame is None or frame.canvas is None or not frame.canvas.is_valid():
+        return None
+    if frame.spot_body is None or frame.spot_body.occluded:
+        return None
+    R        = _rotation_matrix(frame.spot_body.rotation_quat)
+    body_pos = frame.spot_body.position
+    grid = []
+    for row in range(n):
+        for col in range(n):
+            u, v = col / (n - 1), row / (n - 1)
+            t = canvas_to_world(u, v, frame.canvas, z_offset_mm=BRUSH_LENGTH_MM)
+            p = R.T @ (t - body_pos) / 1000.0
+            grid.append(bool(_reachable(p)))
+    return grid
+
+
+def _compute_canvas_rotation(frame):
+    """
+    Returns the display rotation (0/90/180/270) so that the canvas edge
+    closest to Spot's body appears at the bottom of the 2-D display.
+
+      0   — Spot at south (v=1 edge)  — no rotation
+      90  — Spot at west  (u=0 edge)  — 90° CCW: left edge → display bottom
+      180 — Spot at north (v=0 edge)  — 180°:    top edge  → display bottom
+      270 — Spot at east  (u=1 edge)  — 90° CW:  right edge → display bottom
+    """
+    if frame is None or frame.canvas is None or not frame.canvas.is_valid():
+        return 0
+    if frame.spot_body is None or frame.spot_body.occluded:
+        return 0
+    c = frame.canvas
+    center = np.mean(np.array(c.corners), axis=0)
+    toward_spot = np.array(frame.spot_body.position) - center
+    dot_u = float(np.dot(toward_spot, c.x_axis))   # +u = east (u=1 side)
+    dot_v = float(np.dot(toward_spot, c.y_axis))   # +v = south (v=1 side)
+    if abs(dot_v) >= abs(dot_u):
+        return 0 if dot_v >= 0 else 180
+    else:
+        return 270 if dot_u >= 0 else 90
+
+
+def _get_canvas_dims(frame):
+    rotation = _compute_canvas_rotation(frame)
+    if frame and frame.canvas and frame.canvas.is_valid():
+        return {
+            "width_mm":  frame.canvas.width_mm,
+            "height_mm": frame.canvas.height_mm,
+            "rotation":  rotation,
+        }
+    return {"width_mm": 400.0, "height_mm": 400.0, "rotation": 0}
 
 # ---------------------------------------------------------------------------
 # Vicon status display
 # ---------------------------------------------------------------------------
 
-
 def _fmt_rb(rb, label):
-    if rb is None:
-        return f"no data from Vicon for {label}"
-    if rb.occluded:
-        return f"occluded (markers hidden) [{label}]"
+    if rb is None:       return f"no data from Vicon for {label}"
+    if rb.occluded:      return f"occluded [{label}]"
     x, y, z = rb.position
     return f"({x:+8.1f}, {y:+8.1f}, {z:+8.1f}) mm"
 
 
-def _print_status(frame, arm_mode, draw_mode, draw_u, draw_v, pen_down):
-    if frame is None:
-        print("  [Vicon] waiting for first frame…")
+def _print_status(frame, arm_mode, vicon_client=None):
+    if vicon_client is None:
+        print("  [Vicon] not connected — teleop only")
+        print(f"  Mode      : {'ARM' if arm_mode else 'BASE'}")
         return
-
-    if frame.canvas is None:
-        canvas_str = "no data from Vicon for canvas"
-    elif not frame.canvas.is_valid():
-        canvas_str = "canvas markers partially occluded"
-    else:
+    if frame is None:
+        print("  [Vicon] connected but waiting for first frame…")
+        print(f"  Mode      : {'ARM' if arm_mode else 'BASE'}")
+        return
+    canvas_str = "not visible"
+    if frame.canvas and frame.canvas.is_valid():
         c = frame.canvas
-        cx, cy, cz = (c.corners[0] + c.corners[1] + c.corners[2] + c.corners[3]) / 4
-        canvas_str = f"({cx:+8.1f}, {cy:+8.1f}, {cz:+8.1f}) mm  [{c.width_mm:.0f}×{c.height_mm:.0f} mm]"
-
-    mode_str = "DRAW" if draw_mode else ("ARM" if arm_mode else "BASE")
-    draw_info = f"  UV ({draw_u:.3f}, {draw_v:.3f})  pen={'DOWN' if pen_down else 'UP '}" if draw_mode else ""
-
+        center = np.mean(np.array(c.corners), axis=0)
+        canvas_str = (f"({center[0]:+8.1f}, {center[1]:+8.1f}, {center[2]:+8.1f}) mm"
+                      f"  [{c.width_mm:.0f}×{c.height_mm:.0f} mm]")
     print(
         f"  Spot body : {_fmt_rb(frame.spot_body, 'Spot')}\n"
         f"  Spot EE   : {_fmt_rb(frame.spot_ee,   'SpotEE')}\n"
         f"  Canvas    : {canvas_str}\n"
-        f"  Mode      : {mode_str}{draw_info}"
+        f"  Mode      : {'ARM' if arm_mode else 'BASE'}"
     )
 
-
 # ---------------------------------------------------------------------------
-# Robot commands — arm
+# Robot commands
 # ---------------------------------------------------------------------------
-
 
 def send_arm_cartesian(cmd_client, x, y, z, roll, pitch, yaw, frame_name=BODY_FRAME_NAME):
-    cmd = robot_command_pb2.RobotCommand()
+    cmd      = robot_command_pb2.RobotCommand()
     arm_cart = cmd.synchronized_command.arm_command.arm_cartesian_command
     arm_cart.root_frame_name = frame_name
-    point = arm_cart.pose_trajectory_in_task.points.add()
+    point    = arm_cart.pose_trajectory_in_task.points.add()
     point.pose.position.x = x
     point.pose.position.y = y
     point.pose.position.z = z
@@ -197,38 +247,23 @@ def send_arm_cartesian(cmd_client, x, y, z, roll, pitch, yaw, frame_name=BODY_FR
     cmd_client.robot_command(cmd)
 
 
-def _send_draw_command(cmd_client, frame, draw_u, draw_v, pen_down):
-    """
-    Convert canvas UV → Vicon world → odom frame, check IK, send arm command.
-    Returns True on success, False if skipped.
-    """
+def _send_draw_command(cmd_client, frame, u, v, pen_down):
+    """UV → odom arm command. Returns True if sent, False if out of reach."""
     if frame is None or frame.canvas is None or not frame.canvas.is_valid():
-        print("  [DRAW] No canvas visible — can't command.")
         return False
     if frame.spot_body is None or frame.spot_body.occluded:
-        print("  [DRAW] Spot body occluded — can't check IK.")
         return False
-
-    z_offset = BRUSH_LENGTH_MM + (0.0 if pen_down else PEN_UP_EXTRA_MM)
-    target_mm = canvas_to_world(draw_u, draw_v, frame.canvas, z_offset_mm=z_offset)
-
-    # IK check in body frame
-    pos_body_m = _world_to_body(
-        target_mm, frame.spot_body.position, frame.spot_body.rotation_quat
-    )
-    ok, reason = _check_reach(pos_body_m)
-    if not ok:
-        print(f"  [DRAW] OUT OF IK REACH — {reason}")
-        _print_reach_box(frame)
+    z_off     = BRUSH_LENGTH_MM + (0.0 if pen_down else PEN_UP_EXTRA_MM)
+    target_mm = canvas_to_world(u, v, frame.canvas, z_offset_mm=z_off)
+    pos_body  = _world_to_body(target_mm, frame.spot_body.position, frame.spot_body.rotation_quat)
+    if not _reachable(pos_body):
         return False
-
-    # Send in odom frame (Vicon world ≈ odom for this system)
-    x, y, z = target_mm / 1000.0
-    rot = Quaternion(w=0.7071068, x=0.0, y=0.7071068, z=0.0)   # pitch = 90°
-    cmd = robot_command_pb2.RobotCommand()
-    arm_cart = cmd.synchronized_command.arm_command.arm_cartesian_command
+    x, y, z  = target_mm / 1000.0
+    rot       = Quaternion(w=0.7071068, x=0.0, y=0.7071068, z=0.0)
+    cmd       = robot_command_pb2.RobotCommand()
+    arm_cart  = cmd.synchronized_command.arm_command.arm_cartesian_command
     arm_cart.root_frame_name = "odom"
-    point = arm_cart.pose_trajectory_in_task.points.add()
+    point     = arm_cart.pose_trajectory_in_task.points.add()
     point.pose.position.x = x
     point.pose.position.y = y
     point.pose.position.z = z
@@ -238,40 +273,30 @@ def _send_draw_command(cmd_client, frame, draw_u, draw_v, pen_down):
     return True
 
 
-def _print_reach_box(frame):
-    """Sample the canvas at a 20×20 grid and print the reachable UV range."""
-    if frame.canvas is None or not frame.canvas.is_valid():
-        return
-    if frame.spot_body is None or frame.spot_body.occluded:
-        return
-
-    reachable = []
-    N = 20
-    for i in range(N + 1):
-        for j in range(N + 1):
-            u, v = i / N, j / N
-            target_mm = canvas_to_world(u, v, frame.canvas, z_offset_mm=BRUSH_LENGTH_MM)
-            pos_body_m = _world_to_body(
-                target_mm, frame.spot_body.position, frame.spot_body.rotation_quat
-            )
-            if _check_reach(pos_body_m)[0]:
-                reachable.append((u, v))
-
-    if reachable:
-        us = [p[0] for p in reachable]
-        vs = [p[1] for p in reachable]
-        print(
-            f"  [DRAW] Reachable canvas region:"
-            f"  U [{min(us):.2f} – {max(us):.2f}]"
-            f"  V [{min(vs):.2f} – {max(vs):.2f}]"
-        )
+def move_to_draw_pose(cmd_client, vicon_client):
+    """Move arm to above canvas center, brush pointing straight down."""
+    frame = _latest_frame(vicon_client) if vicon_client else None
+    if frame and frame.canvas and frame.canvas.is_valid():
+        c      = frame.canvas
+        center = np.mean(np.array(c.corners), axis=0)
+        pos_mm = center + (BRUSH_LENGTH_MM + PEN_UP_EXTRA_MM) * c.normal
+        x, y, z = pos_mm / 1000.0
+        rot    = Quaternion(w=0.7071068, x=0.0, y=0.7071068, z=0.0)
+        cmd    = robot_command_pb2.RobotCommand()
+        ac     = cmd.synchronized_command.arm_command.arm_cartesian_command
+        ac.root_frame_name = "odom"
+        pt     = ac.pose_trajectory_in_task.points.add()
+        pt.pose.position.x = x
+        pt.pose.position.y = y
+        pt.pose.position.z = z
+        pt.pose.rotation.CopyFrom(rot)
+        pt.time_since_reference.CopyFrom(_dur(2.5))
+        cmd_client.robot_command(cmd)
+        print(f"  Draw pose: canvas center at odom ({x:.3f}, {y:.3f}, {z:.3f}) m")
     else:
-        print("  [DRAW] No canvas region reachable — walk closer to canvas.")
-
-
-# ---------------------------------------------------------------------------
-# Robot commands — gripper / stow / estop
-# ---------------------------------------------------------------------------
+        # Fallback: fixed body-frame pose (arm forward, pointing down)
+        send_arm_cartesian(cmd_client, 0.6, 0.0, -0.1, 0.0, math.pi / 2, 0.0)
+        print("  Draw pose: fixed body-frame fallback (no canvas visible)")
 
 
 def stow_arm(cmd_client):
@@ -297,13 +322,11 @@ def emergency_stop(cmd_client):
     time.sleep(2)
     cmd_client.robot_command(RobotCommandBuilder.synchro_sit_command())
     time.sleep(2)
-    print("Emergency stop complete — robot sitting, arm stowed.")
-
+    print("Emergency stop complete.")
 
 # ---------------------------------------------------------------------------
-# Pick object (identical to full_control.py)
+# Pick object (Phase 1 only)
 # ---------------------------------------------------------------------------
-
 
 def _select_pixel(img):
     h, w = img.shape[:2]
@@ -315,17 +338,14 @@ def _select_pixel(img):
         cv2.line(display, (0, cy), (w, cy), (0, 255, 0), 1)
         cv2.line(display, (cx, 0), (cx, h), (0, 255, 0), 1)
         cv2.circle(display, (cx, cy), 6, (0, 255, 0), 2)
-        cv2.putText(display, f"({cx}, {cy})", (10, 24),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.putText(display, f"({cx},{cy})", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
         cv2.imshow(win, display)
         raw = cv2.waitKeyEx(0)
         key = raw & 0xFF
-        if key == 13 or key == ord(' '):
-            cv2.destroyWindow(win)
-            return (cx, cy)
-        if key == ord('q') or key == 27:
-            cv2.destroyWindow(win)
-            return None
+        if key in (13, ord(' ')):
+            cv2.destroyWindow(win); return (cx, cy)
+        if key in (ord('q'), 27):
+            cv2.destroyWindow(win); return None
         if   raw == 2424832: cx = max(0,   cx - 1)
         elif raw == 2555904: cx = min(w-1, cx + 1)
         elif raw == 2490368: cy = max(0,   cy - 1)
@@ -336,35 +356,6 @@ def _select_pixel(img):
         elif key == ord('s'): cy = min(h-1, cy + 10)
 
 
-def _capture_image(img_client):
-    req = build_image_request(HAND_COLOR_SOURCE, quality_percent=75)
-    resp = img_client.get_image([req])[0]
-    raw = np.frombuffer(resp.shot.image.data, dtype=np.uint8)
-    return cv2.imdecode(raw, cv2.IMREAD_COLOR), resp
-
-
-def _wait_for_grasp(manip_client, cmd_id, timeout=15.0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        fb = manip_client.manipulation_api_feedback_command(
-            manipulation_api_feedback_request=manipulation_api_pb2.ManipulationApiFeedbackRequest(
-                manipulation_cmd_id=cmd_id
-            )
-        )
-        state = fb.current_state
-        print(f"  Grasp state: {manipulation_api_pb2.ManipulationFeedbackState.Name(state)}   ", end="\r")
-        if state in (
-            manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED,
-            manipulation_api_pb2.MANIP_STATE_GRASP_FAILED,
-            manipulation_api_pb2.MANIP_STATE_GRASP_PLANNING_NO_SOLUTION,
-        ):
-            print()
-            return state
-        time.sleep(0.3)
-    print("\nGrasp timed out.")
-    return None
-
-
 def do_pick(cmd_client, img_client, manip_client, arm_pose):
     print("  Moving arm to survey position…")
     ax, ay, az = 0.7, 0.0, 0.0
@@ -372,7 +363,7 @@ def do_pick(cmd_client, img_client, manip_client, arm_pose):
     send_arm_cartesian(cmd_client, ax, ay, az, aroll, apitch, ayaw)
     time.sleep(3)
 
-    PICK_ARM_KEYS = {
+    PICK_KEYS = {
         ord('i'): ("ax", +ARM_STEP_POS), ord('k'): ("ax", -ARM_STEP_POS),
         ord('j'): ("ay", +ARM_STEP_POS), ord('l'): ("ay", -ARM_STEP_POS),
         ord('u'): ("az", +ARM_STEP_POS), ord('o'): ("az", -ARM_STEP_POS),
@@ -381,23 +372,23 @@ def do_pick(cmd_client, img_client, manip_client, arm_pose):
         ord('y'): ("ayaw",   +ARM_STEP_ROT), ord('h'): ("ayaw",   -ARM_STEP_ROT),
     }
 
-    live_win = "Hand Camera  |  ijkl/uo=xyz  rf/tg/yh=rot  SPACE=confirm  q=cancel"
-    cv2.namedWindow(live_win)
-    print("  Live camera open. Adjust arm, then press SPACE.")
+    win = "Hand Camera  |  ijkl/uo=xyz  rf/tg/yh=rot  SPACE=confirm  q=cancel"
+    cv2.namedWindow(win)
+    print("  Adjust arm then press SPACE.")
 
     while True:
-        img, img_response = _capture_image(img_client)
-        cv2.imshow(live_win, img)
+        req  = build_image_request(HAND_COLOR_SOURCE, quality_percent=75)
+        resp = img_client.get_image([req])[0]
+        img  = cv2.imdecode(np.frombuffer(resp.shot.image.data, np.uint8), cv2.IMREAD_COLOR)
+        img_response = resp
+        cv2.imshow(win, img)
         key = cv2.waitKey(50) & 0xFF
-        if key == ord('q') or key == ord('Q'):
-            cv2.destroyAllWindows()
-            arm_pose[:] = [ax, ay, az, aroll, apitch, ayaw]
-            print("  Pick cancelled.")
-            return
-        if key == ord(' ') or key == 13:
+        if key in (ord('q'), ord('Q')):
+            cv2.destroyAllWindows(); arm_pose[:] = [ax,ay,az,aroll,apitch,ayaw]; print("  Cancelled."); return
+        if key in (ord(' '), 13):
             break
-        if key in PICK_ARM_KEYS:
-            attr, delta = PICK_ARM_KEYS[key]
+        if key in PICK_KEYS:
+            attr, delta = PICK_KEYS[key]
             if   attr == "ax":     ax     += delta
             elif attr == "ay":     ay     += delta
             elif attr == "az":     az     += delta
@@ -408,13 +399,16 @@ def do_pick(cmd_client, img_client, manip_client, arm_pose):
 
     arm_pose[:] = [ax, ay, az, aroll, apitch, ayaw]
     cv2.destroyAllWindows()
-    frozen_img, frozen_response = _capture_image(img_client)
 
-    print("  Position crosshair with arrows/WASD, ENTER to confirm.")
-    result = _select_pixel(frozen_img)
+    req  = build_image_request(HAND_COLOR_SOURCE, quality_percent=75)
+    resp = img_client.get_image([req])[0]
+    frozen = cv2.imdecode(np.frombuffer(resp.shot.image.data, np.uint8), cv2.IMREAD_COLOR)
+    frozen_response = resp
+
+    print("  Position crosshair, ENTER to confirm.")
+    result = _select_pixel(frozen)
     if result is None:
-        print("  Pick cancelled.")
-        return
+        print("  Pick cancelled."); return
 
     px, py = result
     print(f"  Picking at pixel ({px}, {py})…")
@@ -424,22 +418,146 @@ def do_pick(cmd_client, img_client, manip_client, arm_pose):
         frame_name_image_sensor=frozen_response.shot.frame_name_image_sensor,
         camera_model=frozen_response.source.pinhole,
     )
-    resp = manip_client.manipulation_api_command(
+    resp2 = manip_client.manipulation_api_command(
         manipulation_api_request=manipulation_api_pb2.ManipulationApiRequest(
             pick_object_in_image=pick_req
         )
     )
-    final = _wait_for_grasp(manip_client, resp.manipulation_cmd_id)
-    if final == manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED:
-        print("  Grasp SUCCEEDED!")
-    else:
-        name = manipulation_api_pb2.ManipulationFeedbackState.Name(final) if final else "timeout"
-        print(f"  Grasp ended: {name}")
+    deadline = time.time() + 15.0
+    while time.time() < deadline:
+        fb = manip_client.manipulation_api_feedback_command(
+            manipulation_api_feedback_request=manipulation_api_pb2.ManipulationApiFeedbackRequest(
+                manipulation_cmd_id=resp2.manipulation_cmd_id
+            )
+        )
+        state = fb.current_state
+        print(f"  Grasp: {manipulation_api_pb2.ManipulationFeedbackState.Name(state)}   ", end="\r")
+        if state in (
+            manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED,
+            manipulation_api_pb2.MANIP_STATE_GRASP_FAILED,
+            manipulation_api_pb2.MANIP_STATE_GRASP_PLANNING_NO_SOLUTION,
+        ):
+            print()
+            if state == manipulation_api_pb2.MANIP_STATE_GRASP_SUCCEEDED:
+                print("  Grasp SUCCEEDED!")
+            else:
+                print(f"  Grasp ended: {manipulation_api_pb2.ManipulationFeedbackState.Name(state)}")
+            return
+        time.sleep(0.3)
+    print("\n  Grasp timed out.")
 
+# ---------------------------------------------------------------------------
+# Draw web server (Phase 2)
+# ---------------------------------------------------------------------------
+
+class DrawServer:
+    """
+    Minimal FastAPI/WebSocket server for Phase 2.
+    Serves the existing draw/ui/static/ files and forwards
+    mouse move commands directly to the robot arm.
+    """
+
+    def __init__(self, cmd_client, vicon_client):
+        self._cmd    = cmd_client
+        self._vicon  = vicon_client
+        self._clients: Set[WebSocket] = set()
+        self._app    = self._build_app()
+        self._thread: Optional[threading.Thread] = None
+
+    def _build_app(self) -> FastAPI:
+        srv = self
+
+        @asynccontextmanager
+        async def lifespan(app: FastAPI):
+            task = asyncio.create_task(srv._push_loop())
+            yield
+            task.cancel()
+
+        app = FastAPI(lifespan=lifespan)
+        app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
+
+        @app.get("/")
+        async def index():
+            with open(os.path.join(_STATIC_DIR, "index.html")) as f:
+                return HTMLResponse(f.read())
+
+        @app.websocket("/ws")
+        async def ws_endpoint(websocket: WebSocket):
+            await websocket.accept()
+            srv._clients.add(websocket)
+            # Tell the UI we're in TELEOP so the canvas is immediately active
+            await websocket.send_json({"type": "mode", "data": "TELEOP"})
+            # Push current canvas dims right away
+            frame = srv._vicon.latest_frame
+            await websocket.send_json({"type": "canvas_dims", **_get_canvas_dims(frame)})
+            try:
+                async for raw in websocket.iter_text():
+                    try:
+                        await srv._handle(json.loads(raw))
+                    except Exception:
+                        pass
+            except WebSocketDisconnect:
+                pass
+            finally:
+                srv._clients.discard(websocket)
+
+        return app
+
+    async def _handle(self, msg: dict):
+        t = msg.get("type")
+        if t == "move":
+            frame = _latest_frame(self._vicon)
+            _send_draw_command(
+                self._cmd, frame,
+                float(msg.get("u", 0.5)),
+                float(msg.get("v", 0.5)),
+                bool(msg.get("pen_down", True)),
+            )
+        elif t == "estop":
+            emergency_stop(self._cmd)
+
+    async def _push_loop(self):
+        import time as _t
+        last = 0.0
+        while True:
+            await asyncio.sleep(0.033)
+            now = _t.monotonic()
+            if now - last >= 1.0:
+                last = now
+                frame = _latest_frame(self._vicon)
+                ik = _compute_ik_grid(frame)
+                if ik:
+                    await self._broadcast({"type": "ik_grid", "n": IK_GRID_N, "data": ik})
+                await self._broadcast({"type": "canvas_dims", **_get_canvas_dims(frame)})
+
+    async def _broadcast(self, msg: dict):
+        dead = set()
+        for ws in self._clients:
+            try:
+                await ws.send_json(msg)
+            except Exception:
+                dead.add(ws)
+        self._clients -= dead
+
+    def start(self):
+        def _run():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            config = uvicorn.Config(
+                self._app, host="0.0.0.0", port=WEB_PORT, log_level="warning"
+            )
+            server = uvicorn.Server(config)
+            loop.run_until_complete(server.serve())
+        self._thread = threading.Thread(target=_run, daemon=True, name="DrawWebServer")
+        self._thread.start()
 
 # ---------------------------------------------------------------------------
 # Main control loop
 # ---------------------------------------------------------------------------
+
+def _latest_frame(vicon_client):
+    """Returns latest frame, or None if vicon_client is None."""
+    return _latest_frame(vicon_client) if vicon_client is not None else None
 
 
 def run(vicon_client, robot):
@@ -451,7 +569,7 @@ def run(vicon_client, robot):
     estop_client = robot.ensure_client(EstopClient.default_service_name)
 
     print("[2/6] Setting up E-Stop…")
-    estop_ep = EstopEndpoint(estop_client, name="vicon_draw_estop", estop_timeout=9.0)
+    estop_ep = EstopEndpoint(estop_client, name="spot_draw_estop", estop_timeout=9.0)
     estop_ep.force_simple_setup()
     print("[3/6] E-Stop configured. Acquiring lease…")
 
@@ -459,45 +577,36 @@ def run(vicon_client, robot):
         EstopKeepAlive(estop_ep),
         LeaseKeepAlive(lease_client, must_acquire=True, return_at_exit=True),
     ):
-        print("[4/6] Lease acquired. Powering on motors…")
+        print("[4/6] Lease acquired. Powering on…")
         robot.power_on(timeout_sec=20)
-        print("[5/6] Motors on. Standing up…")
+        print("[5/6] Standing up…")
         blocking_stand(cmd_client, timeout_sec=10)
-        print("[6/6] Standing. Ready.\n")
+        print("[6/6] Ready.\n")
 
-        print("━" * 60)
-        print("  BASE   w/s=fwd  a/d=strafe  q/e=yaw  SPC=stop")
-        print("  ARM    TAB to toggle | i/k j/l u/o = xyz")
-        print("         r/f t/g y/h = roll/pitch/yaw")
-        print("  DRAW   b to toggle | i/k=±V  j/l=±U on canvas")
-        print("         [ = pen down   ] = pen up")
-        print("  GRIP   [ = open   ] = close  (when not in draw mode)")
-        print("  ARM    z = stow  (also exits draw mode)")
-        print("  PICK   n = pick object from hand camera")
-        print("  ESTOP  ESC = stop + stow + sit")
-        print("  EXIT   x   = clean exit")
-        print("━" * 60 + "\n")
+        print("━" * 52)
+        print("  PHASE 1 — TELEOP")
+        print("  base   w/s/a/d/q/e  |  SPACE = stop")
+        print("  arm    TAB to toggle  |  i/k j/l u/o = xyz")
+        print("                        |  r/f t/g y/h = rpy")
+        print("  grip   [ open   ] close")
+        print("  z = stow   n = pick object")
+        print("  d = draw pose + launch web UI")
+        print("  ESC = emergency stop   x = exit")
+        print("━" * 52 + "\n")
 
-        # Arm state
-        ax, ay, az         = 0.6, 0.0, 0.3
+        ax, ay, az          = 0.6, 0.0, 0.3
         aroll, apitch, ayaw = 0.0, 0.0, 0.0
         arm_pose = [ax, ay, az, aroll, apitch, ayaw]
-
-        # Draw state
-        draw_u, draw_v = 0.5, 0.5
-        pen_down = False
-
-        arm_mode  = False
-        draw_mode = False
+        arm_mode = False
 
         BASE_KEYS = {
-            "w": ( BASE_VELOCITY_MAX, 0,                0),
-            "s": (-BASE_VELOCITY_MAX, 0,                0),
-            "a": (0,  BASE_VELOCITY_MAX,                0),
-            "d": (0, -BASE_VELOCITY_MAX,                0),
-            "q": (0,  0,  BASE_ROTATION_MAX),
-            "e": (0,  0, -BASE_ROTATION_MAX),
-            " ": (0,  0,  0),
+            "w": ( BASE_VELOCITY_MAX, 0, 0),
+            "s": (-BASE_VELOCITY_MAX, 0, 0),
+            "a": (0,  BASE_VELOCITY_MAX, 0),
+            "d": (0, -BASE_VELOCITY_MAX, 0),
+            "q": (0, 0,  BASE_ROTATION_MAX),
+            "e": (0, 0, -BASE_ROTATION_MAX),
+            " ": (0, 0, 0),
         }
 
         ARM_KEYS = {
@@ -509,112 +618,106 @@ def run(vicon_client, robot):
             "y": ("ayaw",   +ARM_STEP_ROT), "h": ("ayaw",   -ARM_STEP_ROT),
         }
 
-        DRAW_KEYS = {
-            "i": ("draw_v", -DRAW_STEP_UV),   # forward on canvas
-            "k": ("draw_v", +DRAW_STEP_UV),   # back
-            "j": ("draw_u", -DRAW_STEP_UV),   # left
-            "l": ("draw_u", +DRAW_STEP_UV),   # right
-        }
-
         last_status_t = 0.0
 
+        # ── Phase 1: teleop loop ─────────────────────────────────────────
         while True:
-            # ── Periodic Vicon status ────────────────────────────────────
             now = time.time()
             if now - last_status_t >= STATUS_INTERVAL:
-                print("─" * 60)
-                _print_status(
-                    vicon_client.latest_frame,
-                    arm_mode, draw_mode, draw_u, draw_v, pen_down,
-                )
+                print("─" * 52)
+                _print_status(_latest_frame(vicon_client), arm_mode, vicon_client)
                 last_status_t = now
 
             key = _get_key()
             if key is None:
                 continue
 
-            # ── Universal keys ───────────────────────────────────────────
             if key == "\x1b":
                 emergency_stop(cmd_client)
                 continue
             if key == "x":
                 break
+
             if key == "z":
-                stow_arm(cmd_client)
-                draw_mode = False
-                continue
+                stow_arm(cmd_client); continue
             if key == "n":
                 do_pick(cmd_client, img_client, manip_client, arm_pose)
                 ax, ay, az, aroll, apitch, ayaw = arm_pose
                 continue
             if key == "p":
-                print(f"  arm  x={ax:.3f} y={ay:.3f} z={az:.3f}  "
-                      f"roll={math.degrees(aroll):.1f}°  "
-                      f"pitch={math.degrees(apitch):.1f}°  "
-                      f"yaw={math.degrees(ayaw):.1f}°")
+                print(f"  arm ({ax:.3f}, {ay:.3f}, {az:.3f})"
+                      f"  rpy ({math.degrees(aroll):.1f}°,"
+                      f" {math.degrees(apitch):.1f}°,"
+                      f" {math.degrees(ayaw):.1f}°)")
                 continue
-
-            # ── Mode toggles ─────────────────────────────────────────────
-            if key == "\t":             # TAB — toggle arm mode, exit draw
-                draw_mode = False
-                arm_mode  = not arm_mode
+            if key == "\t":
+                arm_mode = not arm_mode
                 print(f"  ARM mode: {'ON' if arm_mode else 'OFF'}")
                 continue
-            if key == "b":             # b — toggle draw mode, exit arm
-                arm_mode  = False
-                draw_mode = not draw_mode
-                if draw_mode:
-                    print(f"  DRAW mode ON  |  UV ({draw_u:.3f}, {draw_v:.3f})")
-                    frame = vicon_client.latest_frame
-                    if frame:
-                        _print_reach_box(frame)
-                else:
-                    print("  DRAW mode OFF")
-                continue
 
-            # ── Draw mode keys ───────────────────────────────────────────
-            if draw_mode:
-                frame = vicon_client.latest_frame
+            # ── Enter draw mode ──────────────────────────────────────────
+            if key == "d":
+                if vicon_client is None:
+                    print("  Draw mode requires Vicon — not connected.")
+                    continue
+                print("\n  Moving to draw pose…")
+                move_to_draw_pose(cmd_client, vicon_client)
+                time.sleep(3)
+                print("  Draw pose reached.")
+                print("  Press ENTER to launch web UI, any other key to cancel.")
+                confirm = _get_key(timeout=5.0)
+                if confirm not in ("\r", "\n", " "):
+                    print("  Cancelled.")
+                    continue
 
-                if key == "[":
-                    pen_down = True
-                    print("  Pen DOWN")
-                    _send_draw_command(cmd_client, frame, draw_u, draw_v, pen_down)
-                    continue
-                if key == "]":
-                    pen_down = False
-                    print("  Pen UP")
-                    _send_draw_command(cmd_client, frame, draw_u, draw_v, pen_down)
-                    continue
-                if key in DRAW_KEYS:
-                    attr, delta = DRAW_KEYS[key]
-                    if attr == "draw_u":
-                        draw_u = float(np.clip(draw_u + delta, 0.0, 1.0))
-                    else:
-                        draw_v = float(np.clip(draw_v + delta, 0.0, 1.0))
-                    _send_draw_command(cmd_client, frame, draw_u, draw_v, pen_down)
-                    continue
+                # ── Phase 2: web UI draw loop ────────────────────────────
+                srv = DrawServer(cmd_client, vicon_client)
+                srv.start()
+                time.sleep(0.5)   # give uvicorn a moment to bind
+
+                print(f"\n  Web UI at http://localhost:{WEB_PORT}")
+                print("  Draw with mouse. Press ESC here to exit draw mode.\n")
+
+                last_status_t = 0.0
+                while True:
+                    now = time.time()
+                    if now - last_status_t >= STATUS_INTERVAL:
+                        frame = _latest_frame(vicon_client)
+                        canvas_ok = (frame and frame.canvas and frame.canvas.is_valid())
+                        body_ok   = (frame and frame.spot_body and not frame.spot_body.occluded)
+                        print(f"  [DRAW]  canvas={'OK' if canvas_ok else 'no data'}"
+                              f"  body={'OK' if body_ok else 'no data'}"
+                              f"  — ESC to exit")
+                        last_status_t = now
+
+                    k = _get_key(timeout=0.2)
+                    if k == "\x1b":
+                        # Lift pen before exiting
+                        frame = _latest_frame(vicon_client)
+                        if frame:
+                            _send_draw_command(cmd_client, frame, 0.5, 0.5, pen_down=False)
+                        print("\n  Exited draw mode.")
+                        break
+
+                last_status_t = 0.0
+                continue   # back to Phase 1 teleop
 
             # ── Base ─────────────────────────────────────────────────────
             if key in BASE_KEYS:
                 dvx, dvy, dvyaw = BASE_KEYS[key]
                 cmd_client.robot_command(
                     command=RobotCommandBuilder.synchro_velocity_command(
-                        v_x=dvx, v_y=dvy, v_rot=dvyaw
+                        v_x=dvx, v_y=dvy, v_rot=dvyaw,
                     ),
                     end_time_secs=time.time() + BASE_CMD_DUR,
                 )
                 continue
 
-            # ── Gripper (outside draw mode) ───────────────────────────────
-            if key == "[":
-                open_gripper(cmd_client)
-                continue
-            if key == "]":
-                close_gripper(cmd_client)
-                continue
+            # ── Gripper ──────────────────────────────────────────────────
+            if key == "[": open_gripper(cmd_client);  continue
+            if key == "]": close_gripper(cmd_client); continue
 
-            # ── Arm mode ─────────────────────────────────────────────────
+            # ── Arm ──────────────────────────────────────────────────────
             if arm_mode and key in ARM_KEYS:
                 attr, delta = ARM_KEYS[key]
                 if   attr == "ax":     ax     += delta
@@ -632,42 +735,66 @@ def run(vicon_client, robot):
         time.sleep(2)
         cmd_client.robot_command(RobotCommandBuilder.synchro_sit_command())
         time.sleep(2)
-        print("Done. Goodbye.")
-
+        print("Done.")
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
+VICON_CONNECT_TIMEOUT = 5.0   # seconds to wait for first Vicon frame
+
 
 def main():
-    ap = argparse.ArgumentParser(description="Vicon Draw — full teleop + canvas draw mode")
+    ap = argparse.ArgumentParser(description="Spot Draw — teleop + web UI canvas draw")
     ap.add_argument("--vicon", metavar="HOST:PORT",
-                    help=f"Vicon DataStream address (default: VICON_ADDRESS from env = {VICON_ADDRESS})")
+                    help=f"Vicon address (default: VICON_ADDRESS from env = {VICON_ADDRESS})")
     ap.add_argument("--mock", action="store_true",
-                    help="Use simulated Vicon data (no hardware needed)")
+                    help="Use simulated Vicon (no hardware)")
     args = ap.parse_args()
 
-    if args.mock:
-        vicon = MockViconClient()
-    else:
-        vicon = ViconClient(host=args.vicon or VICON_ADDRESS)
-
-    vicon.start()
-    print("Waiting for first Vicon frame…")
-    while vicon.latest_frame is None:
-        time.sleep(0.01)
-    print("Vicon connected.\n")
-
-    sdk   = bosdyn.client.create_standard_sdk("ViconDraw")
+    # ── Connect to Spot first ────────────────────────────────────────────────
+    print("[1/2] Connecting to Spot…")
+    sdk   = bosdyn.client.create_standard_sdk("SpotDraw")
     robot = sdk.create_robot(ROBOT_IP)
     robot.authenticate(USERNAME, PASSWORD)
     robot.time_sync.wait_for_sync()
+    print("      Spot connected.\n")
+
+    # ── Connect to Vicon (optional) ──────────────────────────────────────────
+    vicon_addr = args.vicon or VICON_ADDRESS
+    if args.mock:
+        print("[2/2] Using mock Vicon client.")
+        vicon = MockViconClient()
+        vicon.start()
+    elif vicon_addr is None:
+        print("[2/2] No VICON_HOST set — running without Vicon (teleop only).")
+        vicon = None
+    else:
+        print(f"[2/2] Connecting to Vicon at {vicon_addr}…")
+        vicon = ViconClient(host=vicon_addr)
+        vicon.start()
+        deadline = time.time() + VICON_CONNECT_TIMEOUT
+        while vicon.latest_frame is None and time.time() < deadline:
+            time.sleep(0.05)
+        if vicon.latest_frame is not None:
+            f = vicon.latest_frame
+            body_ok   = f.spot_body is not None and not f.spot_body.occluded
+            ee_ok     = f.spot_ee   is not None and not f.spot_ee.occluded
+            canvas_ok = f.canvas    is not None and f.canvas.is_valid()
+            print(f"      Vicon connected.")
+            print(f"      Spot body : {'OK' if body_ok   else 'no data'}")
+            print(f"      Spot EE   : {'OK' if ee_ok     else 'no data'}")
+            print(f"      Canvas    : {'OK' if canvas_ok else 'no data'}")
+        else:
+            print(f"      WARNING: no Vicon frames received after {VICON_CONNECT_TIMEOUT:.0f}s.")
+            print("      Running in teleop-only mode (draw mode requires Vicon).\n")
+    print()
 
     try:
         run(vicon, robot)
     finally:
-        vicon.stop()
+        if vicon is not None:
+            vicon.stop()
 
 
 if __name__ == "__main__":

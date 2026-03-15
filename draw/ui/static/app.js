@@ -41,14 +41,49 @@ const ctx = drawCanvas.getContext("2d");
 let canvasWidthMm  = 400;
 let canvasHeightMm = 400;
 
+// Display rotation sent by server (0 / 90 / 180 / 270).
+//   0:   Spot at south — bottom of display = v=1 edge (no transform)
+//   90:  Spot at west  — bottom of display = u=0 edge (90° CCW)
+//   180: Spot at north — bottom of display = v=0 edge (180°)
+//   270: Spot at east  — bottom of display = u=1 edge (90° CW)
+let canvasRotation = 0;
+
 // Internal canvas resolution (set once and reused)
 let CANVAS_W = CANVAS_MAX_PX;
 let CANVAS_H = CANVAS_MAX_PX;
 
-function applyCanvasDims(wMm, hMm) {
+// ---------------------------------------------------------------------------
+// UV coordinate transforms
+// ---------------------------------------------------------------------------
+
+// Canvas UV (server / physical) → display UV (browser pixels)
+function canvasToDisplayUV(u_c, v_c) {
+  switch (canvasRotation) {
+    case  90: return [v_c,       1 - u_c];
+    case 180: return [1 - u_c,   1 - v_c];
+    case 270: return [1 - v_c,   u_c    ];
+    default:  return [u_c,       v_c    ];
+  }
+}
+
+// Display UV (browser pixels) → canvas UV (server / physical)
+function displayToCanvasUV(u_d, v_d) {
+  switch (canvasRotation) {
+    case  90: return [1 - v_d,   u_d    ];
+    case 180: return [1 - u_d,   1 - v_d];
+    case 270: return [v_d,       1 - u_d];
+    default:  return [u_d,       v_d    ];
+  }
+}
+
+function applyCanvasDims(wMm, hMm, rotation = 0) {
   canvasWidthMm  = wMm;
   canvasHeightMm = hMm;
-  const ratio = wMm / hMm;
+  canvasRotation = rotation;
+  // For 90/270 the display axes are swapped
+  const dispW = (rotation === 90 || rotation === 270) ? hMm : wMm;
+  const dispH = (rotation === 90 || rotation === 270) ? wMm : hMm;
+  const ratio = dispW / dispH;
   if (ratio >= 1) {
     CANVAS_W = CANVAS_MAX_PX;
     CANVAS_H = Math.round(CANVAS_MAX_PX / ratio);
@@ -121,20 +156,28 @@ function drawGrid() {
 }
 drawGrid();
 
-// Draw IK reachability overlay onto a canvas context
+// Draw IK reachability overlay onto a canvas context.
+// ikGrid is in canvas UV order; we remap each display cell to canvas UV.
 function drawIkOverlay(targetCtx) {
   if (!ikGrid || !ikGridN || !showIk) return;
   const n = ikGridN;
   const cellW = CANVAS_W / n;
   const cellH = CANVAS_H / n;
   targetCtx.save();
-  for (let row = 0; row < n; row++) {
-    for (let col = 0; col < n; col++) {
-      const ok = ikGrid[row * n + col];
+  for (let row_d = 0; row_d < n; row_d++) {
+    for (let col_d = 0; col_d < n; col_d++) {
+      // Centre of this display cell in display UV
+      const u_d = (col_d + 0.5) / n;
+      const v_d = (row_d + 0.5) / n;
+      // Convert to canvas UV, find the grid cell
+      const [u_c, v_c] = displayToCanvasUV(u_d, v_d);
+      const row_c = Math.max(0, Math.min(n - 1, Math.floor(v_c * n)));
+      const col_c = Math.max(0, Math.min(n - 1, Math.floor(u_c * n)));
+      const ok = ikGrid[row_c * n + col_c];
       targetCtx.fillStyle = ok
         ? "rgba(0, 200, 100, 0.18)"
         : "rgba(220, 53, 69, 0.18)";
-      targetCtx.fillRect(col * cellW, row * cellH, cellW, cellH);
+      targetCtx.fillRect(col_d * cellW, row_d * cellH, cellW, cellH);
     }
   }
   targetCtx.restore();
@@ -148,7 +191,16 @@ function render() {
   // IK reachability overlay (semi-transparent, drawn over strokes)
   drawIkOverlay(ctx);
 
-  // Cursor crosshair
+  // "▲ SPOT" indicator — always at bottom centre, shows which edge faces Spot
+  ctx.save();
+  ctx.fillStyle = "#aaaaaa";
+  ctx.font = "10px monospace";
+  ctx.textAlign = "center";
+  ctx.fillText("▲ SPOT", CANVAS_W / 2, CANVAS_H - 5);
+  ctx.textAlign = "left";
+  ctx.restore();
+
+  // Cursor crosshair (state.brushU/V are in display UV)
   if (state.brushU !== null) {
     const px = state.brushU * CANVAS_W;
     const py = state.brushV * CANVAS_H;
@@ -193,13 +245,16 @@ const state = {
 
 let prevPt = null;   // {u, v} of the last stroke point drawn on offscreen
 
-function applyStroke(u, v, pen_down) {
-  state.brushU = u;
-  state.brushV = v;
+// u_c, v_c are canvas UV (physical coords from server).
+// All rendering uses display UV after rotating through canvasRotation.
+function applyStroke(u_c, v_c, pen_down) {
+  const [u_d, v_d] = canvasToDisplayUV(u_c, v_c);
+  state.brushU  = u_d;
+  state.brushV  = v_d;
   state.penDown = pen_down;
 
-  const px = u * CANVAS_W;
-  const py = v * CANVAS_H;
+  const px = u_d * CANVAS_W;
+  const py = v_d * CANVAS_H;
 
   if (pen_down) {
     if (prevPt) {
@@ -213,20 +268,19 @@ function applyStroke(u, v, pen_down) {
       offCtx.stroke();
       state.strokeCount++;
     } else {
-      // Start of a new stroke — just a dot
       offCtx.beginPath();
       offCtx.fillStyle = "#1a1a1a";
       offCtx.arc(px, py, 1.5, 0, Math.PI * 2);
       offCtx.fill();
     }
-    prevPt = {u, v};
+    prevPt = {u: u_d, v: v_d};
   } else {
-    prevPt = null;   // pen lifted → next pen-down starts a fresh path
+    prevPt = null;
   }
 
   document.getElementById("stroke-num").textContent = state.strokeCount;
-  document.getElementById("info-u").textContent   = u.toFixed(4);
-  document.getElementById("info-v").textContent   = v.toFixed(4);
+  document.getElementById("info-u").textContent   = u_c.toFixed(4);
+  document.getElementById("info-v").textContent   = v_c.toFixed(4);
   document.getElementById("info-pen").textContent = pen_down ? "DOWN" : "UP";
 }
 
@@ -273,7 +327,7 @@ function connect() {
         break;
 
       case "canvas_dims":
-        applyCanvasDims(msg.width_mm, msg.height_mm);
+        applyCanvasDims(msg.width_mm, msg.height_mm, msg.rotation || 0);
         break;
 
       case "ik_grid":
@@ -371,36 +425,38 @@ function setDot(id, ok) {
 // Mouse teleop
 // ---------------------------------------------------------------------------
 
-function canvasUV(evt) {
+// Returns display UV {u_d, v_d} from a mouse/touch event.
+function mouseDisplayUV(evt) {
   const rect = drawCanvas.getBoundingClientRect();
-  // Map CSS pixels to [0,1] UV (canvas internal resolution = CANVAS_PX)
-  const u = (evt.clientX - rect.left)  / rect.width;
-  const v = (evt.clientY - rect.top)   / rect.height;
-  return { u: Math.max(0, Math.min(1, u)), v: Math.max(0, Math.min(1, v)) };
+  const u_d = (evt.clientX - rect.left) / rect.width;
+  const v_d = (evt.clientY - rect.top)  / rect.height;
+  return {
+    u_d: Math.max(0, Math.min(1, u_d)),
+    v_d: Math.max(0, Math.min(1, v_d)),
+  };
 }
 
-// Throttle: only send if position changed by more than this fraction.
+// Throttle: only send if display-UV position changed by more than this.
 const SEND_THRESHOLD = 0.002;
 
-function shouldSend(u, v) {
+function shouldSend(u_d, v_d) {
   if (state.lastMouseU === null) return true;
-  const du = u - state.lastMouseU;
-  const dv = v - state.lastMouseV;
+  const du = u_d - state.lastMouseU;
+  const dv = v_d - state.lastMouseV;
   return Math.sqrt(du*du + dv*dv) >= SEND_THRESHOLD;
 }
 
 drawCanvas.addEventListener("mousemove", (evt) => {
   if (state.mode !== "TELEOP") return;
-  const {u, v} = canvasUV(evt);
+  const {u_d, v_d} = mouseDisplayUV(evt);
+  state.brushU = u_d;
+  state.brushV = v_d;
 
-  // Update local preview even without mouse button
-  state.brushU = u;
-  state.brushV = v;
-
-  if (state.mouseDown && shouldSend(u, v)) {
-    send({ type: "move", u, v, pen_down: true });
-    state.lastMouseU = u;
-    state.lastMouseV = v;
+  if (state.mouseDown && shouldSend(u_d, v_d)) {
+    const [u_c, v_c] = displayToCanvasUV(u_d, v_d);
+    send({ type: "move", u: u_c, v: v_c, pen_down: true });
+    state.lastMouseU = u_d;
+    state.lastMouseV = v_d;
   }
   render();
 });
@@ -409,10 +465,11 @@ drawCanvas.addEventListener("mousedown", (evt) => {
   if (evt.button !== 0) return;
   if (state.mode !== "TELEOP") return;
   state.mouseDown = true;
-  const {u, v} = canvasUV(evt);
-  send({ type: "move", u, v, pen_down: true });
-  state.lastMouseU = u;
-  state.lastMouseV = v;
+  const {u_d, v_d} = mouseDisplayUV(evt);
+  const [u_c, v_c] = displayToCanvasUV(u_d, v_d);
+  send({ type: "move", u: u_c, v: v_c, pen_down: true });
+  state.lastMouseU = u_d;
+  state.lastMouseV = v_d;
   render();
 });
 
@@ -421,9 +478,9 @@ drawCanvas.addEventListener("mouseup", () => {
   state.mouseDown  = false;
   state.lastMouseU = null;
   state.lastMouseV = null;
-  // Lift pen on mouse release
   if (state.mode === "TELEOP" && state.brushU !== null) {
-    send({ type: "move", u: state.brushU, v: state.brushV, pen_down: false });
+    const [u_c, v_c] = displayToCanvasUV(state.brushU, state.brushV);
+    send({ type: "move", u: u_c, v: v_c, pen_down: false });
   }
 });
 
@@ -434,7 +491,8 @@ window.addEventListener("mouseup", () => {
     state.lastMouseU = null;
     state.lastMouseV = null;
     if (state.mode === "TELEOP" && state.brushU !== null) {
-      send({ type: "move", u: state.brushU, v: state.brushV, pen_down: false });
+      const [u_c, v_c] = displayToCanvasUV(state.brushU, state.brushV);
+      send({ type: "move", u: u_c, v: v_c, pen_down: false });
     }
   }
 });
@@ -454,19 +512,22 @@ drawCanvas.addEventListener("touchmove", (evt) => {
   evt.preventDefault();
   if (state.mode !== "TELEOP") return;
   const touch = evt.touches[0];
-  const {u, v} = canvasUV(touch);
-  if (shouldSend(u, v)) {
-    send({ type: "move", u, v, pen_down: true });
-    state.lastMouseU = u;
-    state.lastMouseV = v;
+  const {u_d, v_d} = mouseDisplayUV(touch);
+  if (shouldSend(u_d, v_d)) {
+    const [u_c, v_c] = displayToCanvasUV(u_d, v_d);
+    send({ type: "move", u: u_c, v: v_c, pen_down: true });
+    state.lastMouseU = u_d;
+    state.lastMouseV = v_d;
   }
-  state.brushU = u; state.brushV = v;
+  state.brushU = u_d;
+  state.brushV = v_d;
   render();
 }, { passive: false });
 
 drawCanvas.addEventListener("touchend", () => {
   if (state.mode === "TELEOP" && state.brushU !== null) {
-    send({ type: "move", u: state.brushU, v: state.brushV, pen_down: false });
+    const [u_c, v_c] = displayToCanvasUV(state.brushU, state.brushV);
+    send({ type: "move", u: u_c, v: v_c, pen_down: false });
   }
   state.lastMouseU = null;
   state.lastMouseV = null;
@@ -498,7 +559,7 @@ document.getElementById("btn-reset").addEventListener("click", () => {
 
 document.getElementById("btn-ik").addEventListener("click", () => {
   showIk = !showIk;
-  document.getElementById("btn-ik").textContent = showIk ? "🟢 Hide IK overlay" : "⬜ Show IK overlay";
+  document.getElementById("btn-ik").textContent = showIk ? "Hide IK overlay" : "Show IK overlay";
 });
 
 document.getElementById("btn-clear").addEventListener("click", () => {

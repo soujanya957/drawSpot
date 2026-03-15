@@ -13,6 +13,9 @@ Usage:
 """
 
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 def _require(name):
     val = os.environ.get(name)
@@ -25,10 +28,10 @@ ROBOT_IP = _require("SPOT_IP")
 USERNAME = _require("SPOT_USER")
 PASSWORD = _require("SPOT_PASSWORD")
 
-# --- Vicon DataStream Settings ---
-VICON_HOST = _require("VICON_HOST")
+# --- Vicon DataStream Settings (optional) ---
+VICON_HOST = os.environ.get("VICON_HOST")   # None if not set
 VICON_PORT = int(os.environ.get("VICON_PORT", "801"))
-VICON_ADDRESS = f"{VICON_HOST}:{VICON_PORT}"
+VICON_ADDRESS = f"{VICON_HOST}:{VICON_PORT}" if VICON_HOST else None
 
 # --- Arm / Motion Tuning ---
 ARM_VELOCITY_MAX = 0.5  # m/s, max end-effector cartesian speed
