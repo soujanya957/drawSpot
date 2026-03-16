@@ -59,8 +59,8 @@ from config.robot_config import (
     BASE_ROTATION_MAX, BASE_VELOCITY_MAX,
     PASSWORD, ROBOT_IP, USERNAME, VICON_ADDRESS,
 )
-from draw.vicon.client import MockViconClient, ViconClient
-from draw.vicon.transform import canvas_to_world
+from vicon.client import MockViconClient, ViconClient
+from vicon.transform import canvas_to_world
 
 # ---------------------------------------------------------------------------
 # Constants

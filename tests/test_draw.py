@@ -43,8 +43,8 @@ from bosdyn.client.robot_command import RobotCommandBuilder, RobotCommandClient,
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from config.robot_config import PASSWORD, ROBOT_IP, USERNAME, VICON_ADDRESS
-from draw.vicon.client import MockViconClient, ViconClient
-from draw.vicon.transform import canvas_to_world
+from vicon.client import MockViconClient, ViconClient
+from vicon.transform import canvas_to_world
 
 # ---------------------------------------------------------------------------
 # Constants

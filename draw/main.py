@@ -79,11 +79,11 @@ def main() -> None:
     # 1. Vicon client
     # ------------------------------------------------------------------
     if args.vicon:
-        from draw.vicon.client import ViconClient
+        from vicon.client import ViconClient
         vicon = ViconClient(host=args.vicon)
         logger.info("Using real Vicon client → %s", args.vicon)
     else:
-        from draw.vicon.client import MockViconClient
+        from vicon.client import MockViconClient
         vicon = MockViconClient()
         logger.info("Using mock Vicon client (simulation mode).")
 

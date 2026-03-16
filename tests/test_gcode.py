@@ -59,7 +59,7 @@ from bosdyn.client.robot_state import RobotStateClient
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from config.robot_config import PASSWORD, ROBOT_IP, USERNAME, VICON_ADDRESS  # noqa: E402
-from draw.vicon.client import MockViconClient, ViconClient                   # noqa: E402
+from vicon.client import MockViconClient, ViconClient                   # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Gcode helpers (inlined from spot-sdk/python/examples/arm_gcode/gcode.py)

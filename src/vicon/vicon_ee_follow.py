@@ -138,7 +138,7 @@ def _send_arm_command(
 
 
 def _connect_vicon(host: str):
-    from draw.vicon.client import ViconClient
+    from vicon.client import ViconClient
 
     client = ViconClient(host=host)
     client.start()

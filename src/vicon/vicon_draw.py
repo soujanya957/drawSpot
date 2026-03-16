@@ -72,8 +72,8 @@ from config.robot_config import (
     BASE_ROTATION_MAX, BASE_VELOCITY_MAX,
     PASSWORD, ROBOT_IP, USERNAME, VICON_ADDRESS,
 )
-from draw.vicon.client import MockViconClient, ViconClient
-from draw.vicon.transform import canvas_to_world, clamp_uv
+from vicon.client import MockViconClient, ViconClient
+from vicon.transform import canvas_to_world, clamp_uv
 
 _REPO_ROOT  = __file__.split("/src/")[0]
 _STATIC_DIR = os.path.join(_REPO_ROOT, "draw", "ui", "static")

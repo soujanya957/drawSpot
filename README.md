@@ -27,23 +27,24 @@ echo 'dotenv' > .envrc && direnv allow
 
 ```
 config/
-  robot_config.py       # reads SPOT_IP, SPOT_USER, SPOT_PASSWORD from env
+  robot_config.py       # loads SPOT_IP, SPOT_USER, SPOT_PASSWORD, VICON_HOST from env
 
-draw/                   # Vicon-driven autonomous drawing system
-  main.py               # entry point: starts Vicon + web UI + robot controller
+vicon/                  # shared Vicon library — used by draw/, src/, and tests/
+  client.py             # ViconClient (real DataStream) + MockViconClient
+  transform.py          # world ↔ canvas UV coordinate transforms
+  types.py              # ViconFrame, CanvasFrame, RigidBody, Marker dataclasses
+
+draw/                   # web UI canvas draw (mouse pen-up / pen-down via Vicon)
+  main.py               # entry point: wires Vicon + robot controller + web UI
   robot/
     controller.py       # translates canvas UV coords to Spot arm commands
     state.py            # robot state machine (IDLE / AUTONOMOUS / TELEOP / ESTOP)
-  vicon/
-    client.py           # Vicon DataStream client
-    transform.py        # world ↔ canvas coordinate transforms
-    types.py            # ViconFrame, RigidBody, Marker dataclasses
   ui/
-    server.py           # Flask web server
+    server.py           # FastAPI/WebSocket server
     static/             # browser canvas (index.html + app.js)
 
 src/
-  teleop/               # Manual teleoperation scripts
+  teleop/               # manual teleoperation scripts (no Vicon required)
     full_control.py     # base + arm + gripper + pick (all-in-one, recommended)
     teleop_base.py      # base movement only
     teleop_arm.py       # arm only
@@ -51,21 +52,21 @@ src/
     canvas_draw.py      # mouse-drag → arm draws on physical canvas
     pick_object.py      # click-to-grasp from hand camera
 
-  vicon/                # Vicon-driven positioning and drawing
-    vicon_draw.py         # Manual: full teleop + live Vicon status + web UI canvas draw
-    vicon_draw_auto.py    # Autonomous: walk→pick brush→walk→draw pattern (repeatable)
+  vicon/                # Vicon-driven positioning and drawing scripts
+    vicon_draw.py         # teleop + live Vicon status + web UI canvas draw
+    vicon_draw_auto.py    # autonomous: walk → pick brush → walk → draw pattern
     vicon_base_follow.py  # Vicon body displacement → base walks to match
     vicon_ee_follow.py    # Vicon marker position → arm end-effector follows
 
-patterns/               # Drawing pattern files for vicon_draw_auto.py
-  square.json           # Square outline with diagonals
-  cross.json            # Plus sign
-  spiral.json           # Archimedean spiral
+tests/                  # standalone validation scripts
+  test_nav.py           # walk Spot to brush or canvas and stop at standoff distance
+  test_draw.py          # validate arm drawing from pattern JSON (no navigation)
+  test_gcode.py         # draw from a .gcode file using Vicon canvas as coordinate origin
 
-tests/
-  test_nav.py           # Walk Spot to brush or canvas and stop at standoff distance
-  test_draw.py          # Validate arm drawing from pattern JSON (no navigation)
-  test_gcode.py         # Draw from a .gcode file using Vicon canvas as coordinate origin
+patterns/               # drawing pattern files (UV strokes JSON)
+  square.json           # square outline with diagonals
+  cross.json            # plus sign
+  spiral.json           # Archimedean spiral
 ```
 
 ---

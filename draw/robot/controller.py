@@ -51,8 +51,8 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from .state import RobotMode, RobotStateMachine
-from ..vicon.types import ViconFrame
-from ..vicon.transform import canvas_to_world, clamp_uv, world_to_canvas
+from vicon.types import ViconFrame
+from vicon.transform import canvas_to_world, clamp_uv, world_to_canvas
 
 logger = logging.getLogger(__name__)
 

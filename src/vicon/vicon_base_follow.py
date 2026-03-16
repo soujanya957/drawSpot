@@ -60,7 +60,7 @@ def _yaw_from_quat(q: np.ndarray) -> float:
 
 def _connect_vicon(host: str):
     sys.path.insert(0, __file__.split("/src/")[0])
-    from draw.vicon.client import ViconClient
+    from vicon.client import ViconClient
     client = ViconClient(host=host)
     client.start()
     log.info("Waiting for first Vicon frame…")
