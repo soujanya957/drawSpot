@@ -61,6 +61,11 @@ patterns/               # Drawing pattern files for vicon_draw_auto.py
   square.json           # Square outline with diagonals
   cross.json            # Plus sign
   spiral.json           # Archimedean spiral
+
+tests/
+  test_nav.py           # Walk Spot to brush or canvas and stop at standoff distance
+  test_draw.py          # Validate arm drawing from pattern JSON (no navigation)
+  test_gcode.py         # Draw from a .gcode file using Vicon canvas as coordinate origin
 ```
 
 ---
@@ -112,3 +117,33 @@ Pattern JSON format — each stroke is a list of `[u, v]` points (pen down for t
 ```bash
 python -m src.vicon.vicon_ee_follow --vicon 192.168.1.10:801
 ```
+
+---
+
+## Test scripts
+
+**Navigation test** — walk Spot to brush or canvas and stop at standoff distance:
+```bash
+python -m tests.test_nav --target brush
+python -m tests.test_nav --target canvas
+python -m tests.test_nav --target 500,200,0   # world XYZ in mm
+```
+
+**Draw validation** — arm already at canvas, execute a pattern JSON:
+```bash
+python -m tests.test_draw patterns/square.json
+python -m tests.test_draw patterns/spiral.json --speed 0.5
+python -m tests.test_draw patterns/square.json --mock
+```
+Pre-validates all waypoints for IK reachability before starting.
+
+**Gcode draw** — draw from a `.gcode` file using the Vicon canvas as the coordinate origin:
+```bash
+python -m tests.test_gcode my_drawing.gcode
+python -m tests.test_gcode my_drawing.gcode --scale 0.001   # gcode in mm (default)
+python -m tests.test_gcode my_drawing.gcode --scale 1.0     # gcode in metres
+python -m tests.test_gcode my_drawing.gcode --mock
+```
+Uses `ArmSurfaceContact` for force-compliant drawing. Canvas TL corner and axes from Vicon replace the touch-to-find-ground step. Generate gcode from Inkscape via Extensions → Gcodetools → Path to Gcode, or any CAM tool that outputs G00/G01/G02/G03.
+
+All test scripts: `SPACE` = pause/resume, `RETURN` = emergency stop (stow + sit).
