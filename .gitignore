@@ -13,3 +13,6 @@ spot-sdk/
 
 # OS
 .DS_Store
+
+# Local testing notes (not tracked)
+TESTING.md
