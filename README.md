@@ -43,6 +43,13 @@ draw/                   # web UI canvas draw (mouse pen-up / pen-down via Vicon)
     server.py           # FastAPI/WebSocket server
     static/             # browser canvas (index.html + app.js)
 
+draw_autonomous/        # fully autonomous gcode drawing pipeline (no web UI)
+  main.py               # entry point: walk→pick brush→walk→draw, repeatable
+  robot/
+    navigator.py        # walk_to, pick_brush, move_to_draw_pose
+    gcode_draw.py       # GcodeReader, move_arm, draw_gcode execution loop
+  _ctrl.py              # shared pause/estop events and key listener
+
 src/
   teleop/               # manual teleoperation scripts (no Vicon required)
     full_control.py     # base + arm + gripper + pick (all-in-one, recommended)
@@ -112,6 +119,15 @@ Pattern JSON format — each stroke is a list of `[u, v]` points (pen down for t
     [[0.2, 0.2], [0.8, 0.8]]
   ]
 }
+```
+
+**Fully autonomous gcode draw** (walk → pick brush → walk → draw):
+```bash
+python -m draw_autonomous.main my_drawing.gcode
+python -m draw_autonomous.main my_drawing.gcode --scale 0.001   # gcode in mm (default)
+python -m draw_autonomous.main my_drawing.gcode --repeats 3
+python -m draw_autonomous.main my_drawing.gcode --mock
+# SPACE = pause/resume   RETURN = emergency stop (stow + sit)
 ```
 
 **Vicon EE follow test**:
