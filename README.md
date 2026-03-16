@@ -52,9 +52,15 @@ src/
     pick_object.py      # click-to-grasp from hand camera
 
   vicon/                # Vicon-driven positioning and drawing
-    vicon_draw.py         # Full teleop + live Vicon status + canvas draw mode
+    vicon_draw.py         # Manual: full teleop + live Vicon status + web UI canvas draw
+    vicon_draw_auto.py    # Autonomous: walk→pick brush→walk→draw pattern (repeatable)
     vicon_base_follow.py  # Vicon body displacement → base walks to match
     vicon_ee_follow.py    # Vicon marker position → arm end-effector follows
+
+patterns/               # Drawing pattern files for vicon_draw_auto.py
+  square.json           # Square outline with diagonals
+  cross.json            # Plus sign
+  spiral.json           # Archimedean spiral
 ```
 
 ---
@@ -83,6 +89,24 @@ python -m src.vicon.vicon_draw --mock
 Connects to Spot first, then tries Vicon (5 s timeout). If Vicon is unavailable or
 `VICON_HOST` is not set, the script continues in teleop-only mode — draw mode (`d` key)
 is disabled until Vicon data arrives.
+
+**Autonomous draw** (walk → pick brush → walk → draw pattern):
+```bash
+python -m src.vicon.vicon_draw_auto patterns/square.json
+python -m src.vicon.vicon_draw_auto patterns/spiral.json --repeats 3
+# SPACE = pause/resume   RETURN = emergency stop (stow + sit)
+```
+
+Pattern JSON format — each stroke is a list of `[u, v]` points (pen down for the full stroke, pen lifts between strokes):
+```json
+{
+  "brush_world_mm": [500, 200, 50],
+  "strokes": [
+    [[0.2, 0.2], [0.8, 0.2], [0.8, 0.8], [0.2, 0.8], [0.2, 0.2]],
+    [[0.2, 0.2], [0.8, 0.8]]
+  ]
+}
+```
 
 **Vicon EE follow test**:
 ```bash
