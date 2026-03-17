@@ -310,7 +310,7 @@ def get_transforms(use_vision_frame, robot_state):
 # Main
 # ---------------------------------------------------------------------------
 
-def run(gcode_file, test_only=False):
+def run(initial_gcode_file, test_only=False):
     cfg = configparser.ConfigParser()
     cfg.read(os.path.join(_HERE, 'gcode.cfg'))
     g = cfg['General']
@@ -320,39 +320,37 @@ def run(gcode_file, test_only=False):
     min_dist_to_goal = g.getfloat('min_dist_to_goal', 0.03)
     allow_walking    = g.getboolean('allow_walking', False)
     velocity         = g.getfloat('velocity', 0.15)
-    press_force_pct  = g.getfloat('press_force_percent', -0.01)
+    press_force_pct  = g.getfloat('press_force_percent', -0.005)
     below_z_adm      = g.getfloat('below_z_is_admittance', 0.0)
     travel_z         = g.getfloat('travel_z', 0.05)
+    draw_z_offset    = g.getfloat('draw_z_offset', 0.005)
     gcode_start_x    = g.getfloat('gcode_start_x', 0)
     gcode_start_y    = g.getfloat('gcode_start_y', 0)
     draw_on_wall     = g.getboolean('draw_on_wall', False)
     use_vision_frame = g.getboolean('use_vision_frame', True)
     use_xy_cross     = g.getboolean('use_xy_to_z_cross_term', False)
     bias_force_x     = g.getfloat('bias_force_x', 0.0)
-    walk_end_x = (g.getfloat('walk_to_at_end_rt_gcode_origin_x')
-                  if g.get('walk_to_at_end_rt_gcode_origin_x', None) else None)
-    walk_end_y = (g.getfloat('walk_to_at_end_rt_gcode_origin_y')
-                  if g.get('walk_to_at_end_rt_gcode_origin_y', None) else None)
 
     api_send_frame = VISION_FRAME_NAME if use_vision_frame else ODOM_FRAME_NAME
 
-    robot_ip  = _require_env('SPOT_IP')
-    username  = _require_env('SPOT_USER')
-    password  = _require_env('SPOT_PASSWORD')
-
-    bosdyn.client.util.setup_logging(verbose=False)
-    sdk   = bosdyn.client.create_standard_sdk('GcodeManualClient')
-    robot = sdk.create_robot(robot_ip)
-
-    gcode = GcodeReader(gcode_file, tool_length, scale, robot.logger,
-                        below_z_adm, travel_z, draw_on_wall,
-                        gcode_start_x, gcode_start_y)
-
     if test_only:
+        bosdyn.client.util.setup_logging(verbose=False)
+        sdk   = bosdyn.client.create_standard_sdk('GcodeManualClient')
+        robot = sdk.create_robot('0.0.0.0')  # dummy — not connecting
+        gcode = GcodeReader(initial_gcode_file, tool_length, scale, robot.logger,
+                            below_z_adm, travel_z, draw_on_wall,
+                            gcode_start_x, gcode_start_y, draw_z_offset)
         gcode.test_file_parsing()
         print('File parsing OK.')
         return
 
+    robot_ip = _require_env('SPOT_IP')
+    username = _require_env('SPOT_USER')
+    password = _require_env('SPOT_PASSWORD')
+
+    bosdyn.client.util.setup_logging(verbose=False)
+    sdk   = bosdyn.client.create_standard_sdk('GcodeManualClient')
+    robot = sdk.create_robot(robot_ip)
     robot.authenticate(username, password)
     robot.time_sync.wait_for_sync()
     assert robot.has_arm(), 'Robot requires an arm.'
@@ -366,18 +364,19 @@ def run(gcode_file, test_only=False):
     estop_ep = EstopEndpoint(estop_client, name='gcode_manual_estop', estop_timeout=9.0)
     estop_ep.force_simple_setup()
 
-    with (
-        EstopKeepAlive(estop_ep),
-        bosdyn.client.lease.LeaseKeepAlive(lease_client, must_acquire=True, return_at_exit=True),
-    ):
-        robot.power_on(timeout_sec=20)
-        assert robot.is_powered_on(), 'Power on failed.'
-        blocking_stand(cmd_client, timeout_sec=10)
-        robot.logger.info('Robot standing.')
+    vision_T_admittance = geometry_pb2.SE3Pose(
+        position=geometry_pb2.Vec3(x=0, y=0, z=0),
+        rotation=geometry_pb2.Quaternion(w=1, x=0, y=0, z=0))
+    wr1_T_tool = SE3Pose(0.23589 + tool_length, 0, 0, Quat(w=1, x=0, y=0, z=0))
 
-        robot_state = state_client.get_robot_state()
+    def _draw_file(gcode_file):
+        """Touch-to-find-ground, set origin, execute gcode. Returns vision_T_odom."""
+        gcode = GcodeReader(gcode_file, tool_length, scale, robot.logger,
+                            below_z_adm, travel_z, draw_on_wall,
+                            gcode_start_x, gcode_start_y, draw_z_offset)
 
         # ── Move arm to start position ────────────────────────────────────
+        robot_state = state_client.get_robot_state()
         flat_body_T_hand = SE3Pose(0.75, 0, -0.35, math_helpers.Quat(w=0.707, x=0, y=0.707, z=0))
         (_, odom_T_flat_body, _, _, _, _) = get_transforms(False, robot_state)
         odom_T_hand = odom_T_flat_body * flat_body_T_hand
@@ -392,26 +391,15 @@ def run(gcode_file, test_only=False):
         cmd_id = cmd_client.robot_command(RobotCommandBuilder.build_synchro_command(arm_cmd))
         block_until_arm_arrives(cmd_client, cmd_id)
 
-        # ── Close gripper on taped marker ─────────────────────────────────
-        robot.logger.info('Closing gripper on marker.')
-        gripper_cmd = RobotCommandBuilder.claw_gripper_close_command()
-        gripper_cmd.synchronized_command.gripper_command.claw_gripper_command.maximum_torque.value = 15.0
-        cmd_client.robot_command(gripper_cmd)
-        time.sleep(1.0)
-
         # ── Confirm before touching down ──────────────────────────────────
         print()
         print('=' * 60)
+        print(f' File: {os.path.basename(gcode_file)}')
         print(' Arm is in position above the paper.')
         print(' Press Enter to touch down and begin drawing,')
         print(' or Ctrl-C to abort.')
         print('=' * 60)
         input()
-
-        # ── Build admittance frame (identity for floor drawing) ───────────
-        vision_T_admittance = geometry_pb2.SE3Pose(
-            position=geometry_pb2.Vec3(x=0, y=0, z=0),
-            rotation=geometry_pb2.Quaternion(w=1, x=0, y=0, z=0))
 
         # ── Touch-to-find-ground ──────────────────────────────────────────
         robot_state = state_client.get_robot_state()
@@ -419,7 +407,6 @@ def run(gcode_file, test_only=False):
 
         vision_T_wr1 = get_a_tform_b(robot_state.kinematic_state.transforms_snapshot,
                                      VISION_FRAME_NAME, WR1_FRAME_NAME)
-        wr1_T_tool = SE3Pose(0.23589 + tool_length, 0, 0, Quat(w=1, x=0, y=0, z=0))
         vision_T_tool = vision_T_wr1 * wr1_T_tool
 
         robot.logger.info('Pressing marker down to find surface…')
@@ -443,7 +430,7 @@ def run(gcode_file, test_only=False):
                                      VISION_FRAME_NAME, WR1_FRAME_NAME, validate=True)
         vision_T_tool = vision_T_wr1 * wr1_T_tool
 
-        # ── Set gcode (0,0) at touch point, X aligned with robot heading ──
+        # ── Set gcode (0,0) at touch point ───────────────────────────────
         zhat = [0.0, 0.0, 1.0]
         x1, x2, x3 = vision_T_body.rot.transform_point(1.0, 0.0, 0.0)
         xhat = make_orthogonal(zhat, [x1, x2, x3])
@@ -467,7 +454,7 @@ def run(gcode_file, test_only=False):
 
         if vision_T_goals is None:
             robot.logger.info('Gcode file is empty.')
-            return
+            return vision_T_odom
 
         move_arm(robot_state, is_admittance, vision_T_goals, asc_client, velocity,
                  allow_walking, vision_T_admittance, press_force_pct,
@@ -475,8 +462,7 @@ def run(gcode_file, test_only=False):
         odom_T_hand_goal = vision_T_odom.inverse() * vision_T_goals[-1]
         last_admittance = is_admittance
 
-        done = False
-        while not done:
+        while True:
             robot_state = state_client.get_robot_state()
             (vision_T_body, _, body_T_hand, _, _, odom_T_body) = get_transforms(True, robot_state)
             vision_T_odom = vision_T_body * odom_T_body.inverse()
@@ -507,7 +493,6 @@ def run(gcode_file, test_only=False):
 
                 if vision_T_goals is None:
                     robot.logger.info('Gcode program finished.')
-                    done = True
                     break
 
                 move_arm(robot_state, is_admittance, vision_T_goals, asc_client, velocity,
@@ -524,22 +509,55 @@ def run(gcode_file, test_only=False):
 
             time.sleep(0.05)
 
-        # ── Done ──────────────────────────────────────────────────────────
+        return vision_T_odom
+
+    # ── Robot startup ─────────────────────────────────────────────────────
+    with (
+        EstopKeepAlive(estop_ep),
+        bosdyn.client.lease.LeaseKeepAlive(lease_client, must_acquire=True, return_at_exit=True),
+    ):
+        robot.power_on(timeout_sec=20)
+        assert robot.is_powered_on(), 'Power on failed.'
         blocking_stand(cmd_client, timeout_sec=10)
+        robot.logger.info('Robot standing.')
 
-        if walk_end_x is not None and walk_end_y is not None:
-            robot.logger.info('Walking to end position…')
-            gcode_origin_T_walk = SE3Pose(walk_end_x * scale, walk_end_y * scale,
-                                          0, Quat(1, 0, 0, 0))
-            odom_T_walk = vision_T_odom.inverse() * gcode.vision_T_origin * gcode_origin_T_walk
-            walk_cmd = RobotCommandBuilder.synchro_se2_trajectory_command(
-                SE2Pose.flatten(odom_T_walk).to_proto(), frame_name='odom')
-            cmd_client.robot_command(command=walk_cmd, end_time_secs=time.time() + 15.0)
-            block_for_trajectory_cmd(
-                cmd_client, 1,
-                basic_command_pb2.SE2TrajectoryCommand.Feedback.STATUS_At_Goal,
-                None, 0.1, 15.0)
+        # ── Close gripper on taped marker ─────────────────────────────────
+        robot.logger.info('Closing gripper on marker.')
+        gripper_cmd = RobotCommandBuilder.claw_gripper_close_command()
+        gripper_cmd.synchronized_command.gripper_command.claw_gripper_command.maximum_torque.value = 15.0
+        cmd_client.robot_command(gripper_cmd)
+        time.sleep(1.0)
 
+        # ── Draw loop ─────────────────────────────────────────────────────
+        current_file = initial_gcode_file
+        while True:
+            _draw_file(current_file)
+            blocking_stand(cmd_client, timeout_sec=10)
+
+            print()
+            print('┌─────────────────────────────────┐')
+            print('│  Drawing complete. What next?   │')
+            print('│  1  Stow arm and sit            │')
+            print('│  2  Draw another file           │')
+            print('└─────────────────────────────────┘')
+            choice = input('> ').strip()
+
+            if choice == '2':
+                new_file = input('Path to gcode file: ').strip()
+                if not os.path.exists(new_file):
+                    print(f'  File not found: {new_file}')
+                    print('  Defaulting to stow and sit.')
+                    break
+                current_file = new_file
+            else:
+                break
+
+        # ── Clean exit ────────────────────────────────────────────────────
+        robot.logger.info('Stowing arm and sitting…')
+        cmd_client.robot_command(RobotCommandBuilder.arm_stow_command())
+        time.sleep(2)
+        cmd_client.robot_command(RobotCommandBuilder.synchro_sit_command())
+        time.sleep(2)
         robot.power_off(cut_immediately=False, timeout_sec=20)
         robot.logger.info('Done.')
 
