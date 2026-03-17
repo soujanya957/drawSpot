@@ -17,6 +17,7 @@ spot-sdk/
 # Local testing notes (not tracked)
 TESTING.md
 draw_gcode_checklist.md
+fixes.md
 
 # Student exercise folder (kept local, not pushed)
 student_lab/
