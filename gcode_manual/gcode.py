@@ -79,8 +79,8 @@ def make_orthogonal(primary, secondary):
     return u / np.linalg.norm(u)
 
 
-def list_gcode_files():
-    """Return sorted list of gcode files in the g_codes/ subfolder."""
+def pick_gcode_file():
+    """Show numbered menu of g_codes/ files and return the chosen path."""
     g_codes_dir = os.path.join(_HERE, 'g_codes')
     exts = ('.gcode', '.ngc', '.nc', '.tap')
     files = sorted(
@@ -88,12 +88,6 @@ def list_gcode_files():
         for f in os.listdir(g_codes_dir)
         if f.lower().endswith(exts)
     ) if os.path.isdir(g_codes_dir) else []
-    return files
-
-
-def pick_gcode_file():
-    """Show numbered menu of g_codes/ files and return the chosen path."""
-    files = list_gcode_files()
     if not files:
         raise SystemExit('No gcode files found in g_codes/')
     print()
@@ -113,29 +107,6 @@ def pick_gcode_file():
         print(f'  Enter a number between 1 and {len(files)}.')
 
 
-def get_extents(file_path, scale, gcode_start_x=0, gcode_start_y=0):
-    """Return (min_x, max_x, min_y, max_y) in metres from the gcode file."""
-    xs, ys = [0.0], [0.0]
-    last_x = last_y = 0.0
-    with open(file_path) as f:
-        for line in f:
-            for ch in ('(', '%', ';'):
-                idx = line.find(ch)
-                if idx >= 0:
-                    line = line[:idx]
-            parts = line.split()
-            if not parts or parts[0] not in ('G00', 'G0', 'G01', 'G1',
-                                              'G02', 'G2', 'G03', 'G3'):
-                continue
-            for p in parts[1:]:
-                if p[0] == 'X':
-                    last_x = (float(p[1:]) - gcode_start_x) * scale
-                elif p[0] == 'Y':
-                    last_y = (float(p[1:]) - gcode_start_y) * scale
-            xs.append(last_x)
-            ys.append(last_y)
-    return min(xs), max(xs), min(ys), max(ys)
-
 
 class GcodeReader:
 
@@ -154,6 +125,7 @@ class GcodeReader:
         self.draw_z_offset = draw_z_offset
         self.current_origin_T_goals = None
         self.last_x = self.last_y = self.last_z = 0
+        self._last_line = ''
 
     def set_origin(self, vision_T_origin, vision_T_admittance_frame):
         if not self.draw_on_wall:
@@ -268,20 +240,61 @@ class GcodeReader:
         return self.current_origin_T_goals[0].z < self.below_z_is_admittance
 
     def get_next_vision_T_goals(self, ground_plane_rt_vision, read_new_line=True):
-        origin_T_goals = None
-        while not origin_T_goals:
-            if read_new_line:
-                self.last_line = self.file.readline()
-                self.logger.info('Gcode: %s', self.last_line.strip())
-            if not self.last_line:
+        if not read_new_line:
+            # Re-evaluate current line for travel moves (frame drift refresh).
+            if not self._last_line:
                 return (False, None, False)
-            elif self.last_line.strip() == 'M0':
+            origin_T_goals = self.convert_gcode_to_origin_T_goals(self._last_line)
+            if not origin_T_goals:
+                return (False, None, False)
+            self.current_origin_T_goals = origin_T_goals
+            return (self.is_admittance(),
+                    [self.get_vision_T_goal(g, ground_plane_rt_vision) for g in origin_T_goals],
+                    False)
+
+        # Read forward to find next motion command.
+        origin_T_goals = None
+        while origin_T_goals is None:
+            self._last_line = self.file.readline()
+            self.logger.info('Gcode: %s', self._last_line.strip())
+            if not self._last_line:
+                return (False, None, False)
+            if self._last_line.strip() == 'M0':
                 return (False, None, True)
-            origin_T_goals = self.convert_gcode_to_origin_T_goals(self.last_line)
+            origin_T_goals = self.convert_gcode_to_origin_T_goals(self._last_line)
+
         self.current_origin_T_goals = origin_T_goals
         vision_T_goals = [self.get_vision_T_goal(g, ground_plane_rt_vision)
                           for g in origin_T_goals]
-        return (self.is_admittance(), vision_T_goals, False)
+
+        if not self.is_admittance():
+            # Travel move: return single point, no batching.
+            return (False, vision_T_goals, False)
+
+        # Draw move: greedily batch ALL following admittance lines into one
+        # trajectory so the arm executes the full stroke path in one smooth motion.
+        while True:
+            pos = self.file.tell()
+            next_line = self.file.readline()
+            if not next_line:
+                break  # EOF
+            if next_line.strip() == 'M0':
+                self.file.seek(pos)  # put M0 back for next call
+                break
+            next_goals = self.convert_gcode_to_origin_T_goals(next_line)
+            if next_goals is None:
+                continue  # comment / blank line
+            self.current_origin_T_goals = next_goals
+            if not self.is_admittance():
+                self.file.seek(pos)  # put travel line back for next call
+                break
+            # Still a draw line — log it and append to batch.
+            self.logger.info('Gcode: %s', next_line.strip())
+            self._last_line = next_line
+            vision_T_goals.extend(
+                self.get_vision_T_goal(g, ground_plane_rt_vision) for g in next_goals)
+
+        return (True, vision_T_goals, False)
 
     def test_file_parsing(self):
         for line in self.file:
@@ -438,7 +451,7 @@ def run(initial_gcode_file, test_only=False):
         rotation=geometry_pb2.Quaternion(w=1, x=0, y=0, z=0))
     wr1_T_tool = SE3Pose(0.23589 + tool_length, 0, 0, Quat(w=1, x=0, y=0, z=0))
 
-    def _draw_file(gcode_file, preview_corners=True):
+    def _draw_file(gcode_file):
         """Touch-to-find-ground, set origin, execute gcode. Returns vision_T_odom."""
         gcode = GcodeReader(gcode_file, tool_length, scale, robot.logger,
                             below_z_adm, travel_z, draw_on_wall,
@@ -460,63 +473,6 @@ def run(initial_gcode_file, test_only=False):
         cmd_id = cmd_client.robot_command(RobotCommandBuilder.build_synchro_command(arm_cmd))
         block_until_arm_arrives(cmd_client, cmd_id)
 
-        # ── Preview drawing corners (first draw only) ─────────────────────
-        if preview_corners:
-            robot_state = state_client.get_robot_state()
-            snap = robot_state.kinematic_state.transforms_snapshot
-            vision_T_body_now = get_a_tform_b(snap, VISION_FRAME_NAME, BODY_FRAME_NAME)
-            vision_T_wr1_now  = get_a_tform_b(snap, VISION_FRAME_NAME, WR1_FRAME_NAME)
-            vision_T_tool_now = vision_T_wr1_now * wr1_T_tool
-            preview_z = vision_T_tool_now.z
-
-            zhat_p = np.array([0.0, 0.0, 1.0])
-            bx1, bx2, bx3 = vision_T_body_now.rot.transform_point(1.0, 0.0, 0.0)
-            xhat_p = make_orthogonal(zhat_p, [bx1, bx2, bx3])
-            yhat_p = np.cross(zhat_p, xhat_p)
-
-            min_gx, max_gx, min_gy, max_gy = get_extents(
-                gcode_file, scale, gcode_start_x, gcode_start_y)
-
-            corners = [
-                ('origin      ', min_gx, min_gy),
-                ('far-X       ', max_gx, min_gy),
-                ('far-X far-Y ', max_gx, max_gy),
-                ('far-Y       ', min_gx, max_gy),
-            ]
-
-            print()
-            print('─' * 60)
-            print(f'  Drawing: {os.path.basename(gcode_file)}')
-            print(f'  Size:    {(max_gx - min_gx)*1000:.0f} mm  ×  '
-                  f'{(max_gy - min_gy)*1000:.0f} mm')
-            print('  Pointing to corners — verify arm stays on paper.')
-            print('─' * 60)
-
-            origin_vision = np.array([vision_T_tool_now.x,
-                                       vision_T_tool_now.y,
-                                       vision_T_tool_now.z])
-            prev_quat = Quat.from_matrix(np.array([xhat_p, yhat_p, zhat_p]).T)
-
-            for label, cx, cy in corners:
-                pos = origin_vision + cx * xhat_p + cy * yhat_p
-                corner_cmd = RobotCommandBuilder.arm_pose_command(
-                    pos[0], pos[1], preview_z,
-                    prev_quat.w, prev_quat.x, prev_quat.y, prev_quat.z,
-                    VISION_FRAME_NAME, 2.0)
-                cid = cmd_client.robot_command(
-                    RobotCommandBuilder.build_synchro_command(corner_cmd))
-                block_until_arm_arrives(cmd_client, cid, timeout_sec=5.0)
-                print(f'  → {label}  ({cx*1000:.0f}, {cy*1000:.0f}) mm')
-                time.sleep(1.5)
-
-            # Return to origin before touching down.
-            home_cmd = RobotCommandBuilder.arm_pose_command(
-                origin_vision[0], origin_vision[1], preview_z,
-                prev_quat.w, prev_quat.x, prev_quat.y, prev_quat.z,
-                VISION_FRAME_NAME, 2.0)
-            hid = cmd_client.robot_command(
-                RobotCommandBuilder.build_synchro_command(home_cmd))
-            block_until_arm_arrives(cmd_client, hid, timeout_sec=5.0)
 
         # ── Confirm before touching down ──────────────────────────────────
         print()
@@ -635,6 +591,19 @@ def run(initial_gcode_file, test_only=False):
 
                 if vision_T_goals is None:
                     robot.logger.info('Gcode program finished.')
+                    # Lift marker off paper before returning.
+                    robot_state = state_client.get_robot_state()
+                    snap = robot_state.kinematic_state.transforms_snapshot
+                    vt_wr1 = get_a_tform_b(snap, VISION_FRAME_NAME, WR1_FRAME_NAME)
+                    vt_tool = vt_wr1 * wr1_T_tool
+                    ep = vt_tool.to_proto()
+                    lift = RobotCommandBuilder.arm_pose_command(
+                        ep.position.x, ep.position.y, touch_z + travel_z,
+                        ep.rotation.w, ep.rotation.x, ep.rotation.y, ep.rotation.z,
+                        VISION_FRAME_NAME, 2.0)
+                    lid = cmd_client.robot_command(
+                        RobotCommandBuilder.build_synchro_command(lift))
+                    block_until_arm_arrives(cmd_client, lid, timeout_sec=5.0)
                     break
 
                 move_arm(robot_state, is_admittance, vision_T_goals, asc_client, cmd_client,
@@ -672,10 +641,8 @@ def run(initial_gcode_file, test_only=False):
 
         # ── Draw loop ─────────────────────────────────────────────────────
         current_file = initial_gcode_file
-        first_draw = True
         while True:
-            _draw_file(current_file, preview_corners=first_draw)
-            first_draw = False
+            _draw_file(current_file)
             blocking_stand(cmd_client, timeout_sec=10)
 
             print()
