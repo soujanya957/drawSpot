@@ -79,6 +79,64 @@ def make_orthogonal(primary, secondary):
     return u / np.linalg.norm(u)
 
 
+def list_gcode_files():
+    """Return sorted list of gcode files in the g_codes/ subfolder."""
+    g_codes_dir = os.path.join(_HERE, 'g_codes')
+    exts = ('.gcode', '.ngc', '.nc', '.tap')
+    files = sorted(
+        os.path.join(g_codes_dir, f)
+        for f in os.listdir(g_codes_dir)
+        if f.lower().endswith(exts)
+    ) if os.path.isdir(g_codes_dir) else []
+    return files
+
+
+def pick_gcode_file():
+    """Show numbered menu of g_codes/ files and return the chosen path."""
+    files = list_gcode_files()
+    if not files:
+        raise SystemExit('No gcode files found in g_codes/')
+    print()
+    print('Available gcode files:')
+    for i, f in enumerate(files, 1):
+        print(f'  {i}. {os.path.basename(f)}')
+    while True:
+        raw = input('Pick a file [1]: ').strip()
+        if not raw:
+            return files[0]
+        try:
+            idx = int(raw) - 1
+            if 0 <= idx < len(files):
+                return files[idx]
+        except ValueError:
+            pass
+        print(f'  Enter a number between 1 and {len(files)}.')
+
+
+def get_extents(file_path, scale, gcode_start_x=0, gcode_start_y=0):
+    """Return (min_x, max_x, min_y, max_y) in metres from the gcode file."""
+    xs, ys = [0.0], [0.0]
+    last_x = last_y = 0.0
+    with open(file_path) as f:
+        for line in f:
+            for ch in ('(', '%', ';'):
+                idx = line.find(ch)
+                if idx >= 0:
+                    line = line[:idx]
+            parts = line.split()
+            if not parts or parts[0] not in ('G00', 'G0', 'G01', 'G1',
+                                              'G02', 'G2', 'G03', 'G3'):
+                continue
+            for p in parts[1:]:
+                if p[0] == 'X':
+                    last_x = (float(p[1:]) - gcode_start_x) * scale
+                elif p[0] == 'Y':
+                    last_y = (float(p[1:]) - gcode_start_y) * scale
+            xs.append(last_x)
+            ys.append(last_y)
+    return min(xs), max(xs), min(ys), max(ys)
+
+
 class GcodeReader:
 
     def __init__(self, file_path, tool_length, scale, logger,
@@ -116,7 +174,10 @@ class GcodeReader:
 
     def _goal_quat(self):
         if not self.draw_on_wall:
-            mat = np.array([[0, 0, -1], [0, 1, 0], [1, 0, 0]], dtype=float).T
+            xhat = np.array([0, 0, -1], dtype=float)
+            zhat = np.array([-1, 0, 0], dtype=float)
+            yhat = np.cross(zhat, xhat)  # = [0, -1, 0]
+            mat = np.array([xhat, yhat, zhat]).T
         else:
             mat = np.array([[0, 0, -1], [-1, 0, 0], [0, 1, 0]], dtype=float).T
         return Quat.from_matrix(mat)
@@ -259,9 +320,21 @@ def move_along_trajectory(frame, velocity, tool_T_goals, vision_T_task):
     return trajectory_pb2.SE3Trajectory(points=points)
 
 
-def move_arm(robot_state, is_admittance, vision_T_goals, asc_client, velocity,
+def move_arm(robot_state, is_admittance, vision_T_goals, asc_client, cmd_client, velocity,
              allow_walking, vision_T_admittance, press_force_pct,
              api_send_frame, use_xy_cross, bias_force_x):
+    if not is_admittance:
+        # Travel move: use standard arm_pose_command — reliably lifts off the surface.
+        goal = vision_T_goals[-1]
+        p = goal.to_proto()
+        arm_cmd = RobotCommandBuilder.arm_pose_command(
+            p.position.x, p.position.y, p.position.z,
+            p.rotation.w, p.rotation.x, p.rotation.y, p.rotation.z,
+            VISION_FRAME_NAME, 2.0)
+        cmd_client.robot_command(RobotCommandBuilder.build_synchro_command(arm_cmd))
+        return
+
+    # Draw move: use ArmSurfaceContact for force/admittance control.
     traj = move_along_trajectory(api_send_frame, velocity, vision_T_goals, vision_T_admittance)
     cmd = arm_surface_contact_pb2.ArmSurfaceContact.Request(
         pose_trajectory_in_task=traj,
@@ -270,22 +343,18 @@ def move_arm(robot_state, is_admittance, vision_T_goals, asc_client, velocity,
         press_force_percentage=geometry_pb2.Vec3(x=0, y=0, z=press_force_pct),
         x_axis=arm_surface_contact_pb2.ArmSurfaceContact.Request.AXIS_MODE_POSITION,
         y_axis=arm_surface_contact_pb2.ArmSurfaceContact.Request.AXIS_MODE_POSITION,
-        z_axis=arm_surface_contact_pb2.ArmSurfaceContact.Request.AXIS_MODE_POSITION,
+        z_axis=arm_surface_contact_pb2.ArmSurfaceContact.Request.AXIS_MODE_FORCE,
         max_linear_velocity=wrappers_pb2.DoubleValue(value=velocity),
     )
-    if is_admittance:
-        cmd.z_axis = arm_surface_contact_pb2.ArmSurfaceContact.Request.AXIS_MODE_FORCE
-        cmd.press_force_percentage.z = press_force_pct
-        cmd.xy_admittance = arm_surface_contact_pb2.ArmSurfaceContact.Request.ADMITTANCE_SETTING_OFF
-        cmd.z_admittance = arm_surface_contact_pb2.ArmSurfaceContact.Request.ADMITTANCE_SETTING_LOOSE
-        cmd.xy_to_z_cross_term_admittance = (
-            arm_surface_contact_pb2.ArmSurfaceContact.Request.ADMITTANCE_SETTING_VERY_STIFF
-            if use_xy_cross else
-            arm_surface_contact_pb2.ArmSurfaceContact.Request.ADMITTANCE_SETTING_OFF
-        )
-        cmd.bias_force_ewrt_body.CopyFrom(geometry_pb2.Vec3(x=bias_force_x, y=0, z=0))
-    else:
-        cmd.bias_force_ewrt_body.CopyFrom(geometry_pb2.Vec3(x=0, y=0, z=0))
+    cmd.press_force_percentage.z = press_force_pct
+    cmd.xy_admittance = arm_surface_contact_pb2.ArmSurfaceContact.Request.ADMITTANCE_SETTING_OFF
+    cmd.z_admittance = arm_surface_contact_pb2.ArmSurfaceContact.Request.ADMITTANCE_SETTING_LOOSE
+    cmd.xy_to_z_cross_term_admittance = (
+        arm_surface_contact_pb2.ArmSurfaceContact.Request.ADMITTANCE_SETTING_VERY_STIFF
+        if use_xy_cross else
+        arm_surface_contact_pb2.ArmSurfaceContact.Request.ADMITTANCE_SETTING_OFF
+    )
+    cmd.bias_force_ewrt_body.CopyFrom(geometry_pb2.Vec3(x=bias_force_x, y=0, z=0))
     gripper = RobotCommandBuilder.claw_gripper_open_fraction_command(0)
     cmd.gripper_command.CopyFrom(
         gripper.synchronized_command.gripper_command.claw_gripper_command)
@@ -369,7 +438,7 @@ def run(initial_gcode_file, test_only=False):
         rotation=geometry_pb2.Quaternion(w=1, x=0, y=0, z=0))
     wr1_T_tool = SE3Pose(0.23589 + tool_length, 0, 0, Quat(w=1, x=0, y=0, z=0))
 
-    def _draw_file(gcode_file):
+    def _draw_file(gcode_file, preview_corners=True):
         """Touch-to-find-ground, set origin, execute gcode. Returns vision_T_odom."""
         gcode = GcodeReader(gcode_file, tool_length, scale, robot.logger,
                             below_z_adm, travel_z, draw_on_wall,
@@ -391,13 +460,70 @@ def run(initial_gcode_file, test_only=False):
         cmd_id = cmd_client.robot_command(RobotCommandBuilder.build_synchro_command(arm_cmd))
         block_until_arm_arrives(cmd_client, cmd_id)
 
+        # ── Preview drawing corners (first draw only) ─────────────────────
+        if preview_corners:
+            robot_state = state_client.get_robot_state()
+            snap = robot_state.kinematic_state.transforms_snapshot
+            vision_T_body_now = get_a_tform_b(snap, VISION_FRAME_NAME, BODY_FRAME_NAME)
+            vision_T_wr1_now  = get_a_tform_b(snap, VISION_FRAME_NAME, WR1_FRAME_NAME)
+            vision_T_tool_now = vision_T_wr1_now * wr1_T_tool
+            preview_z = vision_T_tool_now.z
+
+            zhat_p = np.array([0.0, 0.0, 1.0])
+            bx1, bx2, bx3 = vision_T_body_now.rot.transform_point(1.0, 0.0, 0.0)
+            xhat_p = make_orthogonal(zhat_p, [bx1, bx2, bx3])
+            yhat_p = np.cross(zhat_p, xhat_p)
+
+            min_gx, max_gx, min_gy, max_gy = get_extents(
+                gcode_file, scale, gcode_start_x, gcode_start_y)
+
+            corners = [
+                ('origin      ', min_gx, min_gy),
+                ('far-X       ', max_gx, min_gy),
+                ('far-X far-Y ', max_gx, max_gy),
+                ('far-Y       ', min_gx, max_gy),
+            ]
+
+            print()
+            print('─' * 60)
+            print(f'  Drawing: {os.path.basename(gcode_file)}')
+            print(f'  Size:    {(max_gx - min_gx)*1000:.0f} mm  ×  '
+                  f'{(max_gy - min_gy)*1000:.0f} mm')
+            print('  Pointing to corners — verify arm stays on paper.')
+            print('─' * 60)
+
+            origin_vision = np.array([vision_T_tool_now.x,
+                                       vision_T_tool_now.y,
+                                       vision_T_tool_now.z])
+            prev_quat = Quat.from_matrix(np.array([xhat_p, yhat_p, zhat_p]).T)
+
+            for label, cx, cy in corners:
+                pos = origin_vision + cx * xhat_p + cy * yhat_p
+                corner_cmd = RobotCommandBuilder.arm_pose_command(
+                    pos[0], pos[1], preview_z,
+                    prev_quat.w, prev_quat.x, prev_quat.y, prev_quat.z,
+                    VISION_FRAME_NAME, 2.0)
+                cid = cmd_client.robot_command(
+                    RobotCommandBuilder.build_synchro_command(corner_cmd))
+                block_until_arm_arrives(cmd_client, cid, timeout_sec=5.0)
+                print(f'  → {label}  ({cx*1000:.0f}, {cy*1000:.0f}) mm')
+                time.sleep(1.5)
+
+            # Return to origin before touching down.
+            home_cmd = RobotCommandBuilder.arm_pose_command(
+                origin_vision[0], origin_vision[1], preview_z,
+                prev_quat.w, prev_quat.x, prev_quat.y, prev_quat.z,
+                VISION_FRAME_NAME, 2.0)
+            hid = cmd_client.robot_command(
+                RobotCommandBuilder.build_synchro_command(home_cmd))
+            block_until_arm_arrives(cmd_client, hid, timeout_sec=5.0)
+
         # ── Confirm before touching down ──────────────────────────────────
         print()
         print('=' * 60)
         print(f' File: {os.path.basename(gcode_file)}')
-        print(' Arm is in position above the paper.')
-        print(' Press Enter to touch down and begin drawing,')
-        print(' or Ctrl-C to abort.')
+        print(' Arm is in position. Press Enter to touch down')
+        print(' and begin drawing, or Ctrl-C to abort.')
         print('=' * 60)
         input()
 
@@ -410,10 +536,10 @@ def run(initial_gcode_file, test_only=False):
         vision_T_tool = vision_T_wr1 * wr1_T_tool
 
         robot.logger.info('Pressing marker down to find surface…')
-        move_arm(robot_state, True, [vision_T_tool], asc_client, velocity,
+        move_arm(robot_state, True, [vision_T_tool], asc_client, cmd_client, 0.04,
                  allow_walking, vision_T_admittance, press_force_pct,
                  api_send_frame, use_xy_cross, bias_force_x)
-        time.sleep(4.0)
+        time.sleep(5.0)
 
         # ── Re-read state after touchdown ─────────────────────────────────
         robot_state = state_client.get_robot_state()
@@ -430,6 +556,10 @@ def run(initial_gcode_file, test_only=False):
                                      VISION_FRAME_NAME, WR1_FRAME_NAME, validate=True)
         vision_T_tool = vision_T_wr1 * wr1_T_tool
 
+        # Use the actual touch z as the ground reference — more accurate than
+        # GROUND_PLANE_FRAME when the marker is sitting on the paper.
+        ground_plane_rt_vision[2] = vision_T_tool.z
+
         # ── Set gcode (0,0) at touch point ───────────────────────────────
         zhat = [0.0, 0.0, 1.0]
         x1, x2, x3 = vision_T_body.rot.transform_point(1.0, 0.0, 0.0)
@@ -442,6 +572,17 @@ def run(initial_gcode_file, test_only=False):
         gcode.set_origin(vision_T_origin, SE3Pose.from_proto(vision_T_admittance))
         robot.logger.info('Origin set at (%.3f, %.3f, %.3f)',
                           vision_T_origin.x, vision_T_origin.y, vision_T_origin.z)
+
+        # ── Lift arm to travel height before starting gcode loop ──────────
+        touch_z = vision_T_tool.z
+        tp = vision_T_tool.to_proto()
+        robot.logger.info('Lifting arm to travel height (%.3f m)…', touch_z + travel_z)
+        lift_cmd = RobotCommandBuilder.arm_pose_command(
+            tp.position.x, tp.position.y, touch_z + travel_z,
+            tp.rotation.w, tp.rotation.x, tp.rotation.y, tp.rotation.z,
+            VISION_FRAME_NAME, 2.0)
+        lift_id = cmd_client.robot_command(RobotCommandBuilder.build_synchro_command(lift_cmd))
+        block_until_arm_arrives(cmd_client, lift_id, timeout_sec=5.0)
 
         # ── Execute gcode ─────────────────────────────────────────────────
         (is_admittance, vision_T_goals, is_pause) = \
@@ -456,7 +597,7 @@ def run(initial_gcode_file, test_only=False):
             robot.logger.info('Gcode file is empty.')
             return vision_T_odom
 
-        move_arm(robot_state, is_admittance, vision_T_goals, asc_client, velocity,
+        move_arm(robot_state, is_admittance, vision_T_goals, asc_client, cmd_client, velocity,
                  allow_walking, vision_T_admittance, press_force_pct,
                  api_send_frame, use_xy_cross, bias_force_x)
         odom_T_hand_goal = vision_T_odom.inverse() * vision_T_goals[-1]
@@ -466,9 +607,10 @@ def run(initial_gcode_file, test_only=False):
             robot_state = state_client.get_robot_state()
             (vision_T_body, _, body_T_hand, _, _, odom_T_body) = get_transforms(True, robot_state)
             vision_T_odom = vision_T_body * odom_T_body.inverse()
-            gx, gy, gz = vision_T_odom.transform_point(odom_T_ground.x, odom_T_ground.y,
-                                                        odom_T_ground.z)
-            ground_plane_rt_vision = [gx, gy, gz]
+            # Keep ground_plane_rt_vision[2] pinned to the actual touch z.
+            ground_plane_rt_vision[0], ground_plane_rt_vision[1] = (
+                vision_T_odom.transform_point(odom_T_ground.x, odom_T_ground.y, odom_T_ground.z)[:2]
+            )
 
             adm_inv = SE3Pose.from_proto(vision_T_admittance).inverse()
             hand_in_adm = adm_inv * vision_T_odom * odom_T_body * body_T_hand
@@ -495,8 +637,8 @@ def run(initial_gcode_file, test_only=False):
                     robot.logger.info('Gcode program finished.')
                     break
 
-                move_arm(robot_state, is_admittance, vision_T_goals, asc_client, velocity,
-                         allow_walking, vision_T_admittance, press_force_pct,
+                move_arm(robot_state, is_admittance, vision_T_goals, asc_client, cmd_client,
+                         velocity, allow_walking, vision_T_admittance, press_force_pct,
                          api_send_frame, use_xy_cross, bias_force_x)
                 odom_T_hand_goal = vision_T_odom.inverse() * vision_T_goals[-1]
 
@@ -530,8 +672,10 @@ def run(initial_gcode_file, test_only=False):
 
         # ── Draw loop ─────────────────────────────────────────────────────
         current_file = initial_gcode_file
+        first_draw = True
         while True:
-            _draw_file(current_file)
+            _draw_file(current_file, preview_corners=first_draw)
+            first_draw = False
             blocking_stand(cmd_client, timeout_sec=10)
 
             print()
@@ -543,12 +687,7 @@ def run(initial_gcode_file, test_only=False):
             choice = input('> ').strip()
 
             if choice == '2':
-                new_file = input('Path to gcode file: ').strip()
-                if not os.path.exists(new_file):
-                    print(f'  File not found: {new_file}')
-                    print('  Defaulting to stow and sit.')
-                    break
-                current_file = new_file
+                current_file = pick_gcode_file()
             else:
                 break
 
@@ -565,13 +704,16 @@ def run(initial_gcode_file, test_only=False):
 def main():
     parser = argparse.ArgumentParser(
         description='Draw a gcode file on the floor — marker pre-taped to gripper, no Vicon needed')
-    parser.add_argument('gcode', help='Path to .gcode / .ngc file')
+    parser.add_argument('gcode', nargs='?', default=None,
+                        help='Path to .gcode or .ngc file. Omit to pick from g_codes/.')
     parser.add_argument('--test-file-parsing', action='store_true',
                         help='Parse gcode without connecting to robot')
     args = parser.parse_args()
 
-    if not os.path.exists(args.gcode):
-        raise SystemExit(f'Gcode file not found: {args.gcode}')
+    if args.gcode is None:
+        args.gcode = pick_gcode_file()
+    elif not os.path.exists(args.gcode):
+        raise SystemExit(f'File not found: {args.gcode}')
 
     try:
         run(args.gcode, test_only=args.test_file_parsing)

@@ -10,10 +10,12 @@
 ;
 ; Z > 0  → travel (arm lifted)
 ; Z < 0  → draw  (force/admittance mode, marker presses paper)
+;
+; Note: pen transitions to draw mode WHILE moving from (0,0) to (100,0),
+; so there is no stationary poke at the origin.
 
-G00 X0 Y0 Z10       ; travel to bottom-left, lifted
-G01 X0 Y0 Z-1       ; touch down at (0,0)
-G01 X100 Y0         ; bottom edge  →  bottom-right
-G01 X50 Y87         ; right edge   →  top
+G00 X0 Y0 Z10       ; travel above bottom-left, lifted
+G01 X100 Y0 Z-1     ; press + move to bottom-right  (starts drawing mid-stroke)
+G01 X50 Y87         ; right edge   →  apex
 G01 X0 Y0           ; left edge    →  back to start
 G00 X0 Y0 Z10       ; lift off

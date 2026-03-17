@@ -183,7 +183,7 @@ def _read_force_magnitude(state_client):
 
 
 def _auto_calibrate(cmd_client, state_client, anchor, ground_z,
-                    backoff_m=0.001, force_threshold_n=1.5):
+                    backoff_m=0.003, force_threshold_n=0.5):
     """
     Lift arm to +20 mm, descend in 0.5 mm steps, detect contact by wrist force spike.
     Returns the calibrated draw_z_offset in metres.
