@@ -65,10 +65,11 @@ src/
     vicon_base_follow.py  # Vicon body displacement → base walks to match
     vicon_ee_follow.py    # Vicon marker position → arm end-effector follows
 
-tests/                  # standalone validation scripts
-  test_nav.py           # walk Spot to brush or canvas and stop at standoff distance
-  test_draw.py          # validate arm drawing from pattern JSON (no navigation)
-  test_gcode.py         # draw from a .gcode file using Vicon canvas as coordinate origin
+tests/                  # standalone validation scripts (run in order)
+  test_vicon.py         # layer 0: Vicon connection + live data for all subjects
+  test_nav.py           # layer 1: walk Spot to brush or canvas, stop at standoff
+  test_draw.py          # layer 2: validate arm drawing from pattern JSON (no walking)
+  test_gcode.py         # layer 3: draw from a .gcode file using Vicon canvas as origin
 
 patterns/               # drawing pattern files (UV strokes JSON)
   square.json           # square outline with diagonals
@@ -139,7 +140,20 @@ python -m src.vicon.vicon_ee_follow --vicon 192.168.1.10:801
 
 ## Test scripts
 
-**Navigation test** — walk Spot to brush or canvas and stop at standoff distance:
+Run these in order — each layer builds on the one before it. See `TESTING.md` for the full checklist.
+
+**Layer 0 — Vicon connection** (no Spot required):
+```bash
+python -m tests.test_vicon                          # all subjects, live refresh
+python -m tests.test_vicon --target spot_body       # Spot body only
+python -m tests.test_vicon --target spot_ee         # end-effector only
+python -m tests.test_vicon --target brush_tip       # brush marker only
+python -m tests.test_vicon --target canvas          # canvas corners + axes
+python -m tests.test_vicon --once                   # print one frame and exit
+python -m tests.test_vicon --mock                   # no hardware
+```
+
+**Layer 1 — Navigation test** — walk Spot to brush or canvas and stop at standoff distance:
 ```bash
 python -m tests.test_nav --target brush
 python -m tests.test_nav --target canvas

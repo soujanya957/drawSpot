@@ -329,6 +329,72 @@ def _check():
 
 
 # ---------------------------------------------------------------------------
+# Gcode bounds pre-flight scan
+# ---------------------------------------------------------------------------
+
+def _scan_gcode_bounds(file_path: str, scale: float):
+    """Return (x_min, x_max, y_min, y_max) in metres by scanning all moves."""
+    x_vals, y_vals = [0.0], [0.0]
+    cur_x = cur_y = 0.0
+    with open(file_path) as f:
+        for line in f:
+            for ch in ('(', '%', ';'):
+                idx = line.find(ch)
+                if idx >= 0:
+                    line = line[:idx]
+            parts = line.split()
+            if not parts:
+                continue
+            cmd = parts[0]
+            if cmd not in ('G00','G0','G01','G1','G02','G2','G03','G3'):
+                continue
+            x, y, i_val, j_val = cur_x, cur_y, 0.0, 0.0
+            for p in parts[1:]:
+                if not p:
+                    continue
+                if p[0] == 'X':
+                    x = float(p[1:]) * scale
+                elif p[0] == 'Y':
+                    y = float(p[1:]) * scale
+                elif p[0] == 'I':
+                    i_val = float(p[1:]) * scale
+                elif p[0] == 'J':
+                    j_val = float(p[1:]) * scale
+            x_vals.append(x)
+            y_vals.append(y)
+            if cmd in ('G02','G2','G03','G3') and (i_val or j_val):
+                x_vals.append(cur_x + i_val)
+                y_vals.append(cur_y + j_val)
+            cur_x, cur_y = x, y
+    return min(x_vals), max(x_vals), min(y_vals), max(y_vals)
+
+
+def _print_bounds_check(file_path: str, scale: float, canvas) -> None:
+    x_min, x_max, y_min, y_max = _scan_gcode_bounds(file_path, scale)
+    gw = (x_max - x_min) * 1000
+    gh = (y_max - y_min) * 1000
+    print(f"  Gcode extents  X: {x_min*1000:.1f} … {x_max*1000:.1f} mm  ({gw:.1f} mm wide)")
+    print(f"                 Y: {y_min*1000:.1f} … {y_max*1000:.1f} mm  ({gh:.1f} mm tall)")
+    fits = True
+    if x_min < 0 or y_min < 0:
+        print(f"  \033[93m[WARN] Negative coordinates — will draw outside TL corner"
+              f" (X_min={x_min*1000:.1f} mm, Y_min={y_min*1000:.1f} mm)\033[0m")
+        fits = False
+    if x_max * 1000 > canvas.width_mm:
+        print(f"  \033[93m[WARN] Gcode X max ({x_max*1000:.1f} mm)"
+              f" exceeds canvas width ({canvas.width_mm:.1f} mm)"
+              f" — overflow by {x_max*1000 - canvas.width_mm:.1f} mm\033[0m")
+        fits = False
+    if y_max * 1000 > canvas.height_mm:
+        print(f"  \033[93m[WARN] Gcode Y max ({y_max*1000:.1f} mm)"
+              f" exceeds canvas height ({canvas.height_mm:.1f} mm)"
+              f" — overflow by {y_max*1000 - canvas.height_mm:.1f} mm\033[0m")
+        fits = False
+    if fits:
+        print(f"  \033[92m[OK]   Gcode fits within canvas.\033[0m")
+
+
+# ---------------------------------------------------------------------------
 # Build canvas origin from Vicon
 # ---------------------------------------------------------------------------
 
@@ -405,7 +471,9 @@ def run(vicon_client, robot, gcode_path, scale, args):
         print(f"  Canvas origin (TL corner)  odom ({odom_T_origin.x:.3f},"
               f" {odom_T_origin.y:.3f}, {odom_T_origin.z:.3f}) m")
         print(f"  Canvas size  {c.width_mm:.0f} mm × {c.height_mm:.0f} mm")
-        print(f"  Scale        {scale} m per gcode unit\n")
+        print(f"  Scale        {scale} m per gcode unit")
+        _print_bounds_check(gcode_path, scale, c)
+        print()
 
         # ── Build GcodeReader ────────────────────────────────────────────
         # GcodeReader internals use "vision_T_origin" naming but we feed it

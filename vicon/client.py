@@ -95,16 +95,16 @@ class ViconClient(ViconClientBase):
     """
     Real Vicon DataStream client.
 
-    Requires:  pip install vicon-dssdk
-    The SDK package exposes ``ViconDataStream`` at the top level.
+    Requires:  pip install pyvicon-datastream
+    Uses PyViconDatastream which wraps the Vicon C++ SDK.
 
     The client pulls frames as fast as Vicon delivers them (typically 100 Hz
     or 250 Hz depending on capture settings).
     """
 
-    SPOT_SUBJECT = "Spot"
-    EE_SUBJECT = "SpotEE"
-    BRUSH_SUBJECT = "BrushTip"
+    SPOT_SUBJECT   = "Spot"
+    EE_SUBJECT     = "SpotEE"
+    BRUSH_SUBJECT  = "BrushTip"
     CANVAS_SUBJECT = "Canvas"
     CANVAS_MARKERS = ("TL", "TR", "BR", "BL")  # must match Vicon label names
 
@@ -114,28 +114,28 @@ class ViconClient(ViconClientBase):
 
     def _run(self) -> None:
         try:
-            from vicon_dssdk import ViconDataStream as vds  # type: ignore[import]
+            from pyvicon_datastream import PyViconDatastream, Result, StreamMode
         except ImportError:
             raise RuntimeError(
-                "vicon-dssdk is not installed. Run: pip install vicon-dssdk"
+                "pyvicon-datastream is not installed. Run: pip install pyvicon-datastream"
             )
 
-        client = vds.Client()
+        client = PyViconDatastream()
         logger.info(f"[Vicon] Connecting to {self.host} …")
-        client.Connect(self.host)
-        client.EnableSegmentData()
-        client.EnableMarkerData()
-        client.SetStreamMode(vds.StreamMode.ClientPull)
+        client.connect(self.host)
+        client.enable_segment_data()
+        client.enable_marker_data()
+        client.set_stream_mode(StreamMode.ClientPull)
         logger.info("[Vicon] Connected.")
 
         while self._running:
-            result = client.GetFrame()
-            if result != vds.Result.Success:
+            result = client.get_frame()
+            if result != Result.Success:
                 time.sleep(0.002)
                 continue
             self._set_frame(self._parse_frame(client, time.time()))
 
-        client.Disconnect()
+        client.disconnect()
         logger.info("[Vicon] Disconnected.")
 
     # ---------------------------------------------------------------- parsing
@@ -151,24 +151,23 @@ class ViconClient(ViconClientBase):
 
     def _get_rigid_body(self, client, subject: str) -> Optional[RigidBody]:
         try:
-            trans, occ = client.GetSegmentGlobalTranslation(subject, subject)
-            rot, _ = client.GetSegmentGlobalRotationQuaternion(subject, subject)
+            # pyvicon-datastream returns (result, value, occluded)
+            _, trans, occ = client.get_segment_global_translation(subject, subject)
+            _, rot,   _   = client.get_segment_global_quaternion(subject, subject)
         except Exception:
             return None
 
         markers = []
         try:
-            n = client.GetMarkerCount(subject)
+            _, n = client.get_marker_count(subject)
             for i in range(n):
-                mname = client.GetMarkerName(subject, i)
-                mpos, mocc = client.GetMarkerGlobalTranslation(subject, mname)
-                markers.append(
-                    Marker(
-                        name=mname,
-                        position=np.array(mpos, dtype=float),
-                        occluded=bool(mocc),
-                    )
-                )
+                _, mname       = client.get_marker_name(subject, i)
+                _, mpos, mocc  = client.get_marker_global_translation(subject, mname)
+                markers.append(Marker(
+                    name=mname,
+                    position=np.array(mpos, dtype=float),
+                    occluded=bool(mocc),
+                ))
         except Exception:
             pass
 
@@ -182,7 +181,7 @@ class ViconClient(ViconClientBase):
 
     def _get_single_marker(self, client, subject: str) -> Optional[Marker]:
         try:
-            pos, occ = client.GetMarkerGlobalTranslation(subject, subject)
+            _, pos, occ = client.get_marker_global_translation(subject, subject)
             return Marker(
                 name=subject, position=np.array(pos, dtype=float), occluded=bool(occ)
             )
@@ -193,7 +192,8 @@ class ViconClient(ViconClientBase):
         corners: list = []
         for mname in self.CANVAS_MARKERS:
             try:
-                pos, occ = client.GetMarkerGlobalTranslation(self.CANVAS_SUBJECT, mname)
+                _, pos, occ = client.get_marker_global_translation(
+                    self.CANVAS_SUBJECT, mname)
                 if occ:
                     return None
                 corners.append(np.array(pos, dtype=float))

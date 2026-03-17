@@ -261,6 +261,88 @@ def move_arm(robot_state, is_admittance, vision_T_goals, asc_client, velocity,
 
 
 # ---------------------------------------------------------------------------
+# Gcode bounds pre-flight scan
+# ---------------------------------------------------------------------------
+
+def scan_gcode_bounds(file_path: str, scale: float):
+    """
+    Scan a gcode file and return the X/Y extents (in metres) without executing.
+    Returns (x_min, x_max, y_min, y_max) in metres.
+    Accounts for G02/G03 arc centres (I/J offsets) as conservative extra points.
+    """
+    x_vals, y_vals = [0.0], [0.0]
+    cur_x = cur_y = 0.0
+    with open(file_path) as f:
+        for line in f:
+            for ch in ('(', '%', ';'):
+                idx = line.find(ch)
+                if idx >= 0:
+                    line = line[:idx]
+            parts = line.split()
+            if not parts:
+                continue
+            cmd = parts[0]
+            if cmd not in ('G00','G0','G01','G1','G02','G2','G03','G3'):
+                continue
+            x, y, i_val, j_val = cur_x, cur_y, 0.0, 0.0
+            for p in parts[1:]:
+                if not p:
+                    continue
+                if p[0] == 'X':
+                    x = float(p[1:]) * scale
+                elif p[0] == 'Y':
+                    y = float(p[1:]) * scale
+                elif p[0] == 'I':
+                    i_val = float(p[1:]) * scale
+                elif p[0] == 'J':
+                    j_val = float(p[1:]) * scale
+            x_vals.append(x)
+            y_vals.append(y)
+            if cmd in ('G02','G2','G03','G3') and (i_val or j_val):
+                # arc centre as a conservative bound point
+                x_vals.append(cur_x + i_val)
+                y_vals.append(cur_y + j_val)
+            cur_x, cur_y = x, y
+    return min(x_vals), max(x_vals), min(y_vals), max(y_vals)
+
+
+def print_bounds_check(file_path: str, scale: float, canvas) -> bool:
+    """
+    Print gcode extents vs canvas size.
+    Returns True if gcode fits within canvas, False if it overflows (still continues).
+    """
+    x_min, x_max, y_min, y_max = scan_gcode_bounds(file_path, scale)
+    # convert metres → mm for display
+    gw = (x_max - x_min) * 1000
+    gh = (y_max - y_min) * 1000
+    gx0, gy0 = x_min * 1000, y_min * 1000
+
+    print(f"  Gcode extents  X: {gx0:.1f} … {x_max*1000:.1f} mm  ({gw:.1f} mm wide)")
+    print(f"                 Y: {gy0:.1f} … {y_max*1000:.1f} mm  ({gh:.1f} mm tall)")
+    print(f"  Canvas size    {canvas.width_mm:.1f} mm × {canvas.height_mm:.1f} mm")
+
+    fits = True
+    if x_min < 0 or y_min < 0:
+        print(f"  \033[93m[WARN] Gcode has negative coordinates"
+              f" (X_min={gx0:.1f} mm, Y_min={gy0:.1f} mm)"
+              f" — will draw outside TL corner\033[0m")
+        fits = False
+    if x_max * 1000 > canvas.width_mm:
+        print(f"  \033[93m[WARN] Gcode X max ({x_max*1000:.1f} mm)"
+              f" exceeds canvas width ({canvas.width_mm:.1f} mm)"
+              f" — overflow by {x_max*1000 - canvas.width_mm:.1f} mm\033[0m")
+        fits = False
+    if y_max * 1000 > canvas.height_mm:
+        print(f"  \033[93m[WARN] Gcode Y max ({y_max*1000:.1f} mm)"
+              f" exceeds canvas height ({canvas.height_mm:.1f} mm)"
+              f" — overflow by {y_max*1000 - canvas.height_mm:.1f} mm\033[0m")
+        fits = False
+    if fits:
+        print(f"  \033[92m[OK]   Gcode fits within canvas.\033[0m")
+    return fits
+
+
+# ---------------------------------------------------------------------------
 # Canvas origin from Vicon
 # ---------------------------------------------------------------------------
 
@@ -284,41 +366,42 @@ def build_canvas_origin(frame) -> SE3Pose:
 
 
 # ---------------------------------------------------------------------------
-# Main draw function
+# Shared execution core (Vicon-independent)
 # ---------------------------------------------------------------------------
 
-def draw_gcode(vicon_client, asc_client, cmd_client, state_client,
-               gcode_path: str, scale: float, tool_length: float) -> None:
+def _draw_gcode_impl(asc_client, cmd_client, state_client,
+                     gcode_path: str, scale: float, tool_length: float,
+                     odom_T_origin: SE3Pose, canvas_z: float,
+                     canvas_width_mm: float = None,
+                     canvas_height_mm: float = None) -> None:
     """
-    Execute a gcode file using the Vicon canvas as the coordinate origin.
+    Core drawing loop shared by draw_gcode and draw_gcode_manual.
 
-    - Reads the current canvas geometry from Vicon.
-    - Builds a GcodeReader with the canvas TL corner as (0, 0).
-    - Moves arm to start position above canvas.
-    - Executes G00/G01/G02/G03 commands using ArmSurfaceContact.
-    - Pauses on M0 (SPACE to continue).
-    - Honours _ctrl.check() for SPACE/RETURN at every tick.
+    Parameters
+    ----------
+    odom_T_origin     SE3Pose for gcode (0, 0) in the odom frame.
+                      Position in metres; rotation encodes canvas orientation
+                      (+X = gcode X direction on the floor plane).
+    canvas_z          Drawing surface height in odom frame (metres).
+    canvas_width_mm / canvas_height_mm
+                      Optional: only used for the pre-flight bounds check print.
+                      Pass None to skip the check.
     """
     import logging
     logger = logging.getLogger("draw_autonomous.gcode_draw")
 
-    # ── Read Vicon canvas origin ──────────────────────────────────────────
-    print("  Reading canvas origin from Vicon…")
-    deadline = time.time() + 5.0
-    frame = None
-    while time.time() < deadline:
-        frame = vicon_client.latest_frame
-        if frame and frame.canvas and frame.canvas.is_valid():
-            break
-        time.sleep(0.1)
-    if frame is None or frame.canvas is None or not frame.canvas.is_valid():
-        raise RuntimeError("Canvas not visible in Vicon — cannot set gcode origin.")
+    print(f"  Canvas origin  odom ({odom_T_origin.x:.3f},"
+          f" {odom_T_origin.y:.3f}, {odom_T_origin.z:.3f}) m"
+          f"  |  canvas_z {canvas_z:.3f} m  |  scale {scale}")
 
-    odom_T_origin = build_canvas_origin(frame)
-    c = frame.canvas
-    print(f"  Canvas origin (TL)  odom ({odom_T_origin.x:.3f},"
-          f" {odom_T_origin.y:.3f}, {odom_T_origin.z:.3f}) m")
-    print(f"  Canvas size  {c.width_mm:.0f} x {c.height_mm:.0f} mm  |  scale {scale}\n")
+    if canvas_width_mm is not None and canvas_height_mm is not None:
+
+        class _FakeCanvas:
+            width_mm  = canvas_width_mm
+            height_mm = canvas_height_mm
+
+        print_bounds_check(gcode_path, scale, _FakeCanvas())
+    print()
 
     # ── Identity admittance frame (flat canvas) ───────────────────────────
     vision_T_admittance = geometry_pb2.SE3Pose(
@@ -337,11 +420,9 @@ def draw_gcode(vicon_client, asc_client, cmd_client, state_client,
         draw_on_wall=False,
     )
     gcode.set_origin(odom_T_origin, SE3Pose.from_proto(vision_T_admittance))
-    print("  Gcode origin set from Vicon canvas.\n")
+    print("  Gcode origin set.\n")
 
-    # Canvas surface z in odom (replaces touch-to-find-ground)
-    canvas_z_odom = float(np.mean([c.corners[i][2] for i in range(4)])) / 1000.0
-    ground_plane  = [0.0, 0.0, canvas_z_odom]
+    ground_plane = [0.0, 0.0, canvas_z]
 
     # ── Move arm to starting position above canvas ────────────────────────
     robot_state = state_client.get_robot_state()
@@ -438,3 +519,100 @@ def draw_gcode(vicon_client, asc_client, cmd_client, state_client,
                 gcode.get_next_vision_T_goals(ground_plane, read_new_line=False)
 
         time.sleep(0.05)
+
+
+# ---------------------------------------------------------------------------
+# Main draw functions
+# ---------------------------------------------------------------------------
+
+def draw_gcode(vicon_client, asc_client, cmd_client, state_client,
+               gcode_path: str, scale: float, tool_length: float) -> None:
+    """
+    Execute a gcode file using the Vicon canvas as the coordinate origin.
+
+    - Reads the current canvas geometry from Vicon.
+    - Builds a GcodeReader with the canvas TL corner as (0, 0).
+    - Moves arm to start position above canvas.
+    - Executes G00/G01/G02/G03 commands using ArmSurfaceContact.
+    - Pauses on M0 (SPACE to continue).
+    - Honours _ctrl.check() for SPACE/RETURN at every tick.
+    """
+    print("  Reading canvas origin from Vicon…")
+    deadline = time.time() + 5.0
+    frame = None
+    while time.time() < deadline:
+        frame = vicon_client.latest_frame
+        if frame and frame.canvas and frame.canvas.is_valid():
+            break
+        time.sleep(0.1)
+    if frame is None or frame.canvas is None or not frame.canvas.is_valid():
+        raise RuntimeError("Canvas not visible in Vicon — cannot set gcode origin.")
+
+    odom_T_origin = build_canvas_origin(frame)
+    c = frame.canvas
+    canvas_z = float(np.mean([c.corners[i][2] for i in range(4)])) / 1000.0
+
+    _draw_gcode_impl(
+        asc_client, cmd_client, state_client,
+        gcode_path, scale, tool_length,
+        odom_T_origin, canvas_z,
+        canvas_width_mm=c.width_mm,
+        canvas_height_mm=c.height_mm,
+    )
+
+
+def draw_gcode_manual(asc_client, cmd_client, state_client,
+                      gcode_path: str, scale: float, tool_length: float,
+                      origin_x: float, origin_y: float, origin_z: float,
+                      x_axis=(1.0, 0.0, 0.0),
+                      canvas_z: float = None,
+                      canvas_width_mm: float = None,
+                      canvas_height_mm: float = None) -> None:
+    """
+    Execute a gcode file without Vicon, using manually supplied canvas parameters.
+
+    Parameters
+    ----------
+    origin_x/y/z   Position of gcode (0, 0) in the odom frame, in metres.
+                   Typically the top-left corner of the drawing area.
+    x_axis         Unit vector (odom frame) for the gcode +X direction on the
+                   floor plane.  Defaults to odom +X = (1, 0, 0).
+    canvas_z       Drawing surface height in the odom frame (metres).
+                   Defaults to origin_z if not supplied.
+    canvas_width_mm / canvas_height_mm
+                   Optional canvas dimensions in mm — only used for the
+                   pre-flight bounds check print.  Pass None to skip.
+
+    Example
+    -------
+    # Canvas TL corner 1 m ahead of robot, gcode X points to robot's right,
+    # drawing surface is at floor level (z = 0):
+    draw_gcode_manual(
+        asc_client, cmd_client, state_client,
+        "drawing.gcode", scale=0.001, tool_length=0.0,
+        origin_x=1.0, origin_y=0.0, origin_z=0.0,
+        x_axis=(0.0, -1.0, 0.0),
+        canvas_z=0.0,
+        canvas_width_mm=300, canvas_height_mm=200,
+    )
+    """
+    xa = np.array(x_axis, dtype=float)
+    xa /= np.linalg.norm(xa)
+    za = np.array([0.0, 0.0, 1.0])
+    ya = np.cross(za, xa)
+    mat = np.column_stack([xa, ya, za])
+    odom_T_origin = SE3Pose(
+        x=float(origin_x),
+        y=float(origin_y),
+        z=float(origin_z),
+        rot=Quat.from_matrix(mat),
+    )
+
+    _draw_gcode_impl(
+        asc_client, cmd_client, state_client,
+        gcode_path, scale, tool_length,
+        odom_T_origin,
+        canvas_z=float(canvas_z if canvas_z is not None else origin_z),
+        canvas_width_mm=canvas_width_mm,
+        canvas_height_mm=canvas_height_mm,
+    )

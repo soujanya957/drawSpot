@@ -1,0 +1,19 @@
+; Simple equilateral triangle, 100 mm sides
+; With scale=0.001 in gcode.cfg this draws a 10 cm triangle.
+; Gcode (0,0) = bottom-left corner of the triangle.
+;
+;         (50, 87)
+;           /\
+;          /  \
+;         /    \
+;  (0,0) /______\ (100,0)
+;
+; Z > 0  → travel (arm lifted)
+; Z < 0  → draw  (force/admittance mode, marker presses paper)
+
+G00 X0 Y0 Z10       ; travel to bottom-left, lifted
+G01 X0 Y0 Z-1       ; touch down at (0,0)
+G01 X100 Y0         ; bottom edge  →  bottom-right
+G01 X50 Y87         ; right edge   →  top
+G01 X0 Y0           ; left edge    →  back to start
+G00 X0 Y0 Z10       ; lift off
