@@ -8,23 +8,22 @@ Stages
   vicon    Verify Vicon data for all subjects — no Spot required
   nav      Walk Spot to canvas standoff and face canvas
   marker   Open gripper, wait for marker placement, close gripper
-  pose     Move arm above canvas in draw pose
   draw     Execute a gcode file (arm assumed already near canvas — skips nav)
-  full     Complete pipeline: nav → marker → pose → draw
+  full     Complete pipeline: nav → marker → draw
 
 Usage
 -----
     python -m tests.test_draw_gcode --stage vicon  --vicon 169.254.217.218:801
     python -m tests.test_draw_gcode --stage nav    --vicon 169.254.217.218:801
     python -m tests.test_draw_gcode --stage marker --vicon 169.254.217.218:801
-    python -m tests.test_draw_gcode --stage pose   --vicon 169.254.217.218:801
     python -m tests.test_draw_gcode --stage draw   --vicon 169.254.217.218:801
     python -m tests.test_draw_gcode --stage full   --vicon 169.254.217.218:801
 
 Controls during robot stages
 -----------------------------
-    SPACE   — emergency stop (stow + sit)
+    SPACE   — emergency stop (stow + sit immediately)
     ENTER   — confirm marker placement
+    x       — sit and exit after a stage completes
 """
 
 import argparse
@@ -40,7 +39,7 @@ from vicon.client import MockViconClient, ViconClient                        # n
 from draw_gcode.main import G_CODES_DIR, select_gcode                       # noqa: E402
 
 VICON_CONNECT_TO = 6.0
-STAGES = ("vicon", "nav", "marker", "pose", "draw", "full")
+STAGES = ("vicon", "nav", "marker", "draw", "full")
 
 SEP  = "─" * 52
 SEP2 = "━" * 52
@@ -142,18 +141,29 @@ def _stand(robot, cmd_client) -> None:
     blocking_stand(cmd_client, timeout_sec=10)
     print("  Robot standing.")
     print()
-    print("  SPACE = emergency stop  |  ENTER = confirm marker placement")
+    print("  SPACE = emergency stop  |  ENTER = confirm  |  x = sit and exit")
     print()
     _ctrl.start_key_listener()
 
 
-def _cleanup(cmd_client) -> None:
+def _stow(cmd_client) -> None:
+    """Stow arm only — robot stays standing."""
     from bosdyn.client.robot_command import RobotCommandBuilder
     print()
-    print("  Cleaning up — stowing arm and sitting…")
+    print("  Stowing arm…")
     try:
         cmd_client.robot_command(RobotCommandBuilder.arm_stow_command())
         time.sleep(2)
+    except Exception:
+        pass
+    print("  Arm stowed. Robot still standing.")
+
+
+def _sit_and_exit(cmd_client) -> None:
+    """Sit the robot and exit."""
+    from bosdyn.client.robot_command import RobotCommandBuilder
+    print("  Sitting…")
+    try:
         cmd_client.robot_command(RobotCommandBuilder.synchro_sit_command())
         time.sleep(2)
     except Exception:
@@ -211,14 +221,30 @@ def main() -> None:
         return
 
     # ── All other stages need Spot ─────────────────────────────────────────
-    print(f"Connecting to Spot…")
+    print("Connecting to Spot…")
     robot = _connect_spot()
-    print(f"Spot connected.")
+    print("Spot connected.")
     print()
 
     import draw_gcode._ctrl as _ctrl
     from draw_gcode.robot.navigator import walk_to_canvas, open_for_marker, move_to_draw_pose
-    from draw_gcode.robot.gcode_exec import execute as gcode_execute, compute_canvas_scale
+    from draw_gcode.main import _draw_file, compute_scale, _load_cfg
+
+    # Select gcode before _stand() so input() works (key listener not yet running)
+    gcode_path = None
+    scale = None
+    if args.stage in ("draw", "full"):
+        frame = vicon.latest_frame
+        if frame is None or frame.canvas is None or not frame.canvas.is_valid():
+            vicon.stop()
+            raise SystemExit("FAIL — canvas not visible in Vicon")
+        c = frame.canvas
+        print(f"  Canvas  {c.width_mm:.0f} mm × {c.height_mm:.0f} mm")
+        os.makedirs(G_CODES_DIR, exist_ok=True)
+        gcode_path = select_gcode()
+        print("  Computing auto-scale…")
+        scale = compute_scale(gcode_path, c, margin=args.margin)
+        print()
 
     lc, cmd_client, sc, asc_client, estop_ka, lease_ka = _get_clients(robot)
 
@@ -240,49 +266,24 @@ def main() -> None:
                 print()
                 print(f"  Result: {'OK — marker acquired' if ok else 'STOPPED'}")
 
-            elif args.stage == "pose":
-                ok = move_to_draw_pose(cmd_client, vicon)
-                print()
-                print(f"  Result: {'OK — draw pose reached' if ok else 'STOPPED'}")
-
             elif args.stage in ("draw", "full"):
-                frame = vicon.latest_frame
-                if frame is None or frame.canvas is None or not frame.canvas.is_valid():
-                    print("  FAIL — canvas not visible in Vicon")
+                cfg = _load_cfg()
+                if args.stage == "full":
+                    ok = walk_to_canvas(cmd_client, vicon)
+                    if ok and _ctrl.check():
+                        ok = open_for_marker(cmd_client)
+                    if ok and _ctrl.check():
+                        _draw_file(gcode_path, scale, vicon, sc, cmd_client, asc_client,
+                                   robot.logger, cfg)
                 else:
-                    c = frame.canvas
-                    print(f"  Canvas  {c.width_mm:.0f} mm × {c.height_mm:.0f} mm")
+                    # draw only — arm assumed already at canvas
+                    _draw_file(gcode_path, scale, vicon, sc, cmd_client, asc_client,
+                               robot.logger, cfg)
 
-                    # Select gcode
-                    os.makedirs(G_CODES_DIR, exist_ok=True)
-                    gcode_path = select_gcode()
-
-                    # Auto-scale
-                    print("  Computing auto-scale…")
-                    scale = compute_canvas_scale(gcode_path, c, margin=args.margin)
-                    print()
-
-                    if args.stage == "full":
-                        ok = walk_to_canvas(cmd_client, vicon)
-                        if ok and _ctrl.check():
-                            ok = open_for_marker(cmd_client)
-                        if ok and _ctrl.check():
-                            ok = move_to_draw_pose(cmd_client, vicon)
-                        if ok and _ctrl.check():
-                            try:
-                                gcode_execute(vicon, asc_client, cmd_client, sc,
-                                              gcode_path, scale=scale)
-                            except RuntimeError as exc:
-                                print(f"  [ERROR] {exc}")
-                    else:
-                        # draw only — arm assumed already at canvas
-                        try:
-                            gcode_execute(vicon, asc_client, cmd_client, sc,
-                                          gcode_path, scale=scale)
-                        except RuntimeError as exc:
-                            print(f"  [ERROR] {exc}")
-
-            _cleanup(cmd_client)
+            # ── Stage done: stow arm, wait for x to sit ────────────────────
+            _stow(cmd_client)
+            _ctrl.wait_finish("Stage complete. Press x to sit and exit.")
+            _sit_and_exit(cmd_client)
 
     finally:
         vicon.stop()
