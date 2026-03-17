@@ -3,7 +3,7 @@ Vicon DataStream Client
 ========================
 Two implementations sharing a common interface:
 
-  ViconClient      — wraps the real Vicon DataStream SDK (vicon-dssdk).
+  ViconClient      — wraps the official Vicon C SDK dylib via ctypes (vicon/sdk.py).
   MockViconClient  — generates synthetic motion for testing without hardware.
 
 Both classes are thread-safe: a background thread continuously pulls frames
@@ -12,10 +12,10 @@ thread to get the most recent ViconFrame.
 
 Subject / marker naming convention expected on the Vicon server:
 
-    Subject "Spot"      → Spot body     (rigid body, segment = "Spot")
-    Subject "SpotEE"    → end-effector  (rigid body, segment = "SpotEE")
-    Subject "BrushTip"  → brush tip     (single unlabelled marker)
-    Subject "Canvas"    → canvas plane  (4 markers: "TL", "TR", "BR", "BL")
+    Subject "spot_base"   → Spot body     (rigid body, segment = "spot_base")
+    Subject "spot_ee"     → end-effector  (rigid body, segment = "spot_ee")
+    Subject "BrushTip"    → brush tip     (single marker, optional)
+    Subject "test_canvas" → canvas plane  (4 markers: auto-sorted into TL/TR/BR/BL)
 
 Usage:
     client = MockViconClient()          # or ViconClient("192.168.1.10:801")
@@ -95,47 +95,44 @@ class ViconClient(ViconClientBase):
     """
     Real Vicon DataStream client.
 
-    Requires:  pip install pyvicon-datastream
-    Uses PyViconDatastream which wraps the Vicon C++ SDK.
+    Uses the official Vicon C SDK dylib via ctypes (vicon/sdk.py).
+    Requires libViconDataStreamSDK_C.dylib — see vicon/sdk.py for search paths.
 
     The client pulls frames as fast as Vicon delivers them (typically 100 Hz
     or 250 Hz depending on capture settings).
     """
 
-    SPOT_SUBJECT   = "Spot"
-    EE_SUBJECT     = "SpotEE"
-    BRUSH_SUBJECT  = "BrushTip"
-    CANVAS_SUBJECT = "Canvas"
-    CANVAS_MARKERS = ("TL", "TR", "BR", "BL")  # must match Vicon label names
+    SPOT_SUBJECT   = "spot_base"
+    EE_SUBJECT     = "spot_ee"
+    BRUSH_SUBJECT  = "BrushTip"   # optional — frames have brush_tip=None if absent
+    CANVAS_SUBJECT = "test_canvas"
+    CANVAS_MARKERS = ("test_canvas1", "test_canvas2", "test_canvas3", "test_canvas4")
 
     def __init__(self, host: str = "localhost:801") -> None:
         super().__init__()
         self.host = host
 
     def _run(self) -> None:
-        try:
-            from pyvicon_datastream import PyViconDatastream, Result, StreamMode
-        except ImportError:
-            raise RuntimeError(
-                "pyvicon-datastream is not installed. Run: pip install pyvicon-datastream"
-            )
+        from .sdk import ViconSDKClient, SUCCESS, CLIENT_PULL
 
-        client = PyViconDatastream()
         logger.info(f"[Vicon] Connecting to {self.host} …")
-        client.connect(self.host)
+        client = ViconSDKClient()
+        r = client.connect(self.host)
+        if r != SUCCESS:
+            raise RuntimeError(f"Vicon connect failed (result={r})")
         client.enable_segment_data()
         client.enable_marker_data()
-        client.set_stream_mode(StreamMode.ClientPull)
+        client.set_stream_mode(CLIENT_PULL)
         logger.info("[Vicon] Connected.")
 
         while self._running:
-            result = client.get_frame()
-            if result != Result.Success:
+            if client.get_frame() != SUCCESS:
                 time.sleep(0.002)
                 continue
             self._set_frame(self._parse_frame(client, time.time()))
 
         client.disconnect()
+        client.destroy()
         logger.info("[Vicon] Disconnected.")
 
     # ---------------------------------------------------------------- parsing
@@ -150,26 +147,26 @@ class ViconClient(ViconClientBase):
         )
 
     def _get_rigid_body(self, client, subject: str) -> Optional[RigidBody]:
-        try:
-            # pyvicon-datastream returns (result, value, occluded)
-            _, trans, occ = client.get_segment_global_translation(subject, subject)
-            _, rot,   _   = client.get_segment_global_quaternion(subject, subject)
-        except Exception:
+        trans, occ = client.get_segment_global_translation(subject, subject)
+        if trans is None:
+            return None
+        rot, _ = client.get_segment_global_rotation_quaternion(subject, subject)
+        if rot is None:
             return None
 
         markers = []
-        try:
-            _, n = client.get_marker_count(subject)
-            for i in range(n):
-                _, mname       = client.get_marker_name(subject, i)
-                _, mpos, mocc  = client.get_marker_global_translation(subject, mname)
+        n = client.get_marker_count(subject)
+        for i in range(n):
+            mname = client.get_marker_name(subject, i)
+            if mname is None:
+                continue
+            mpos, mocc = client.get_marker_global_translation(subject, mname)
+            if mpos is not None:
                 markers.append(Marker(
                     name=mname,
                     position=np.array(mpos, dtype=float),
                     occluded=bool(mocc),
                 ))
-        except Exception:
-            pass
 
         return RigidBody(
             name=subject,
@@ -180,26 +177,28 @@ class ViconClient(ViconClientBase):
         )
 
     def _get_single_marker(self, client, subject: str) -> Optional[Marker]:
-        try:
-            _, pos, occ = client.get_marker_global_translation(subject, subject)
-            return Marker(
-                name=subject, position=np.array(pos, dtype=float), occluded=bool(occ)
-            )
-        except Exception:
+        pos, occ = client.get_marker_global_translation(subject, subject)
+        if pos is None:
             return None
+        return Marker(name=subject, position=np.array(pos, dtype=float), occluded=bool(occ))
 
     def _get_canvas(self, client) -> Optional[CanvasFrame]:
-        corners: list = []
+        pts: list = []
         for mname in self.CANVAS_MARKERS:
-            try:
-                _, pos, occ = client.get_marker_global_translation(
-                    self.CANVAS_SUBJECT, mname)
-                if occ:
-                    return None
-                corners.append(np.array(pos, dtype=float))
-            except Exception:
+            pos, occ = client.get_marker_global_translation(self.CANVAS_SUBJECT, mname)
+            if pos is None or occ:
                 return None
-        return CanvasFrame(corners=corners) if len(corners) == 4 else None
+            pts.append(np.array(pos, dtype=float))
+        if len(pts) != 4:
+            return None
+
+        # Sort into TL, TR, BR, BL by X then Y (works for any marker numbering).
+        # Assumes canvas lies roughly in the XY plane (Z is the normal axis).
+        by_x = sorted(pts, key=lambda p: p[0])
+        left  = sorted(by_x[:2], key=lambda p: p[1])  # [low-Y, high-Y]
+        right = sorted(by_x[2:], key=lambda p: p[1])  # [low-Y, high-Y]
+        # TL=left[0], TR=right[0], BR=right[1], BL=left[1]
+        return CanvasFrame(corners=[left[0], right[0], right[1], left[1]])
 
 
 # ---------------------------------------------------------------------------
