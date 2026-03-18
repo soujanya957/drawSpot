@@ -54,7 +54,8 @@ NAV_SPEED           = 0.35  # m/s
 BASE_CMD_DUR        = 0.6   # velocity command duration (s)
 YAW_ALIGN_TOL       = 0.05  # rad (~3°) — acceptable alignment error
 
-_DOWN_QUAT = Quaternion(w=0.7071068, x=0.0, y=0.7071068, z=0.0)
+_DOWN_QUAT    = Quaternion(w=0.7071068, x=0.0, y=0.7071068, z=0.0)
+_HANDOFF_QUAT = Quaternion(w=0.9239,   x=0.0, y=0.3827,   z=0.0)   # ~45° tilt, easy handoff
 
 
 # ---------------------------------------------------------------------------
@@ -330,11 +331,19 @@ def walk_to_canvas(cmd_client, vicon_client) -> bool:
 
 def open_for_marker(cmd_client) -> bool:
     """
-    Extend arm to handoff pose, open gripper, wait for operator to place the
-    marker and press ENTER, then close the gripper.
+    Extend arm to a comfortable forward handoff pose (angled, NOT top-down),
+    open gripper, wait for operator to place the marker and press ENTER to
+    close the gripper, then wait for a second ENTER to confirm the grip looks
+    good before proceeding.
+
+    Key bindings during this step:
+      ENTER (1st) — close gripper around marker
+      ENTER (2nd) — confirm marker is secure, ready to proceed
+      SPACE       — emergency stop at any point
     """
     print("  Moving arm to marker handoff pose…")
-    _arm_body(cmd_client, x=0.65, y=0.0, z=-0.25, quat=_DOWN_QUAT, dur_s=2.5)
+    # Angled forward pose — easy for a person to insert a marker
+    _arm_body(cmd_client, x=0.65, y=0.0, z=0.05, quat=_HANDOFF_QUAT, dur_s=2.5)
     if not _ctrl.sleep(3.0):
         return False
 
@@ -343,7 +352,7 @@ def open_for_marker(cmd_client) -> bool:
     if not _ctrl.sleep(1.0):
         return False
 
-    if not _ctrl.wait_confirm("Place the marker / pen in the open gripper."):
+    if not _ctrl.wait_confirm("Place the marker / pen in the open gripper, then press ENTER to close."):
         return False
 
     print("  Closing gripper…")
@@ -351,9 +360,7 @@ def open_for_marker(cmd_client) -> bool:
     if not _ctrl.sleep(1.5):
         return False
 
-    print("  Lifting arm…")
-    _arm_body(cmd_client, x=0.55, y=0.0, z=0.05, quat=_DOWN_QUAT, dur_s=1.5)
-    if not _ctrl.sleep(2.0):
+    if not _ctrl.wait_confirm("Marker secured. Check grip looks good, then press ENTER to proceed."):
         return False
 
     print("  Marker acquired.")

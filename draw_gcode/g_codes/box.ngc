@@ -1,0 +1,11 @@
+; Simple 150 x 100 mm box — use with scale = 0.001 in gcode.cfg
+; Z > 0 → travel (position mode)
+; Z < 0 → draw (admittance/force mode)
+
+G00 X0 Y0 Z10       ; travel to start, lifted
+G01 X0 Y0 Z-1       ; touch down at origin
+G01 X150 Y0         ; right
+G01 X150 Y100       ; up
+G01 X0 Y100         ; left
+G01 X0 Y0           ; back to start
+G00 X0 Y0 Z10       ; lift off

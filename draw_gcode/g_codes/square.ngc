@@ -1,0 +1,18 @@
+; Simple 100 x 100 mm square
+; With scale=0.001 in gcode.cfg this draws a 10 cm square.
+;
+;  (0,100) _________ (100,100)
+;         |         |
+;         |         |
+;  (0,0)  |_________| (100,0)
+;
+; Z > 0  → travel (arm lifted)
+; Z < 0  → draw  (force/admittance mode)
+
+G00 X0 Y0 Z10       ; travel to bottom-left, lifted
+G01 X0 Y0 Z-1       ; touch down at (0,0)
+G01 X100 Y0         ; bottom edge →
+G01 X100 Y100       ; right edge  ↑
+G01 X0 Y100         ; top edge    ←
+G01 X0 Y0           ; left edge   ↓  back to start
+G00 X0 Y0 Z10       ; lift off

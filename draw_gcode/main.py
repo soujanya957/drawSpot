@@ -1,173 +1,628 @@
 """
-draw_gcode/main.py — Autonomous walk + manual marker + gcode drawing
-=====================================================================
+draw_gcode/main.py — Autonomous walk + marker grab + gcode drawing
+====================================================================
 Pipeline
 --------
-  1. Connect Vicon  — verify canvas is visible
-  2. Select gcode   — numbered menu from draw_gcode/g_codes/
-  3. Auto-scale     — fit drawing within canvas (90% fill, aspect-ratio preserved)
-  4. Connect Spot   — authenticate + time-sync
-  5. Stand up       — power on, stand
-  6. Walk to canvas — approach TL/TR edge, rotate to face canvas (+X toward canvas)
-  7. Place marker   — extend arm, open gripper, wait for ENTER, close gripper
-  8. Draw pose      — raise arm above canvas centre
-  9. Draw gcode     — execute file via ArmSurfaceContact with Vicon canvas origin
+  1. Connect Vicon — verify canvas is visible
+  2. Connect Spot  — authenticate + time-sync
+  3. Stand up + start key listener
+  4. Walk to canvas (auto-nav via Vicon)
+  5. Open for marker (extend arm, wait ENTER, close gripper)
+  --- Drawing loop ---
+  6. Select gcode file
+  7. Touch-to-find-ground + draw (same mechanism as gcode_manual/gcode.py)
+  8. Stow arm, stand
+  9. "Draw another?" → if yes, back to 6
+     "Change marker?" → if yes, back to 5 then 6
+  ---
+  10. Sit and exit
 
-Controls (during robot operation)
-----------------------------------
-  SPACE   — emergency stop  (stows arm + sits immediately)
-  ENTER   — confirm marker placement (step 7 only)
+Key bindings (during robot operation)
+--------------------------------------
+  SPACE / ESC  — emergency stop (stow + sit)
+  ENTER        — confirm (marker placement, arm position, M0 pauses)
+  x / X        — sit and exit when prompted
 
 Usage
 -----
     python -m draw_gcode.main --vicon 169.254.217.218:801
-    python -m draw_gcode.main --vicon 169.254.217.218:801 --repeats 2
-    python -m draw_gcode.main --vicon 169.254.217.218:801 --tool-length 0.15
 """
 
-import argparse
-import glob
+import configparser
+import math as _math
 import os
 import sys
 import time
 
+import numpy as np
+
 import bosdyn.client
 import bosdyn.client.util
+from bosdyn.api import geometry_pb2
 from bosdyn.client.arm_surface_contact import ArmSurfaceContactClient
 from bosdyn.client.estop import EstopClient, EstopEndpoint, EstopKeepAlive
+from bosdyn.client.frame_helpers import (
+    ODOM_FRAME_NAME, VISION_FRAME_NAME, WR1_FRAME_NAME,
+    GROUND_PLANE_FRAME_NAME, get_a_tform_b,
+)
 from bosdyn.client.lease import LeaseClient, LeaseKeepAlive
-from bosdyn.client.robot_command import RobotCommandBuilder, RobotCommandClient, blocking_stand
+from bosdyn.client.math_helpers import Quat, SE3Pose
+from bosdyn.client.robot_command import (
+    RobotCommandBuilder, RobotCommandClient, blocking_stand,
+)
 from bosdyn.client.robot_state import RobotStateClient
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from config.robot_config import PASSWORD, ROBOT_IP, USERNAME, VICON_ADDRESS  # noqa: E402
 from vicon.client import ViconClient                                          # noqa: E402
 
-import draw_gcode._ctrl as _ctrl
-from draw_gcode.robot.navigator import walk_to_canvas, open_for_marker, move_to_draw_pose
-from draw_gcode.robot.gcode_exec import execute as gcode_execute, compute_canvas_scale
+import draw_gcode._ctrl as _ctrl                                              # noqa: E402
+from draw_gcode.robot.navigator import walk_to_canvas, open_for_marker       # noqa: E402
 
-VICON_CONNECT_TO = 6.0
+# Drawing primitives — same implementation as the proven gcode_manual approach
+from gcode_manual.gcode import GcodeReader, make_orthogonal, move_arm, get_transforms  # noqa: E402
+
+VICON_CONNECT_TO  = 6.0
 G_CODES_DIR = os.path.join(os.path.dirname(__file__), "g_codes")
+_CFG_PATH   = os.path.join(os.path.dirname(__file__), "gcode.cfg")
+
+_ARM_REACH_IDEAL_MM = 600.0   # desired distance from body to canvas centre (mm)
+_ARM_REACH_TOL_MM   =  50.0   # acceptable error before walking is triggered (mm)
 
 
 # ---------------------------------------------------------------------------
-# Gcode selection
+# Config
+# ---------------------------------------------------------------------------
+
+def _load_cfg() -> dict:
+    cfg = configparser.ConfigParser()
+    cfg.read(_CFG_PATH)
+    g = cfg['General']
+    return dict(
+        tool_length      = g.getfloat('tool_length', 0.0),
+        allow_walking    = g.getboolean('allow_walking', False),
+        velocity         = g.getfloat('velocity', 0.15),
+        press_force_pct  = g.getfloat('press_force_percent', -0.002),
+        below_z_adm      = g.getfloat('below_z_is_admittance', 0.0),
+        travel_z         = g.getfloat('travel_z', 0.05),
+        draw_z_offset    = g.getfloat('draw_z_offset', 0.005),
+        min_dist_to_goal = g.getfloat('min_dist_to_goal', 0.03),
+        gcode_start_x    = g.getfloat('gcode_start_x', 0),
+        gcode_start_y    = g.getfloat('gcode_start_y', 0),
+        draw_on_wall     = g.getboolean('draw_on_wall', False),
+        use_vision_frame = g.getboolean('use_vision_frame', True),
+        use_xy_cross     = g.getboolean('use_xy_to_z_cross_term', False),
+        bias_force_x     = g.getfloat('bias_force_x', 0.0),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gcode selection  (uses input() — call with key listener stopped)
 # ---------------------------------------------------------------------------
 
 def select_gcode() -> str:
-    """
-    Present a numbered menu of .gcode / .nc files from draw_gcode/g_codes/.
-    Uses normal input() — call this BEFORE starting the key listener.
-    Returns the selected file path.
-    """
-    patterns = ("*.gcode", "*.nc", "*.ngc")
+    exts = ('.gcode', '.nc', '.ngc', '.tap')
     files = []
-    for pat in patterns:
-        files.extend(glob.glob(os.path.join(G_CODES_DIR, pat)))
-    files = sorted(set(files))
-
+    if os.path.isdir(G_CODES_DIR):
+        files = sorted(
+            os.path.join(G_CODES_DIR, n) for n in os.listdir(G_CODES_DIR)
+            if n.lower().endswith(exts)
+        )
     if not files:
         raise SystemExit(
-            f"\nNo gcode files found in  {os.path.relpath(G_CODES_DIR)}/\n"
-            f"Add .gcode / .nc files there and re-run.\n"
+            f"\nNo gcode files found in {G_CODES_DIR}/\n"
+            f"Add .gcode / .ngc files there and re-run.\n"
         )
 
-    print(f"\nGcode files available in  {os.path.relpath(G_CODES_DIR)}/")
-    print(f"{'─' * 50}")
+    print(f"\nGcode files in {os.path.relpath(G_CODES_DIR)}/")
+    print('─' * 50)
     for i, f in enumerate(files, 1):
-        name = os.path.basename(f)
-        kb   = os.path.getsize(f) / 1024
-        print(f"  [{i}]  {name}  ({kb:.1f} KB)")
-    print(f"{'─' * 50}")
+        kb = os.path.getsize(f) / 1024
+        print(f"  [{i}]  {os.path.basename(f)}  ({kb:.1f} KB)")
+    print('─' * 50)
 
     while True:
-        try:
-            raw = input(f"Select file [1–{len(files)}]: ").strip()
-            idx = int(raw) - 1
-            if 0 <= idx < len(files):
-                chosen = files[idx]
-                print(f"  → {os.path.basename(chosen)}\n")
-                return chosen
-        except (ValueError, EOFError):
-            pass
-        print(f"  Enter a number between 1 and {len(files)}.")
+        raw = input(f"Select [1–{len(files)}]: ").strip()
+        if not raw:
+            chosen = files[0]
+        else:
+            try:
+                idx = int(raw) - 1
+                if 0 <= idx < len(files):
+                    chosen = files[idx]
+                else:
+                    print(f"  Enter a number between 1 and {len(files)}.")
+                    continue
+            except ValueError:
+                print(f"  Enter a number between 1 and {len(files)}.")
+                continue
+        print(f"  → {os.path.basename(chosen)}\n")
+        return chosen
 
 
 # ---------------------------------------------------------------------------
-# Robot pipeline
+# Auto-scale: fit gcode within canvas
 # ---------------------------------------------------------------------------
 
-def run(vicon_client, robot, gcode_path: str, tool_length: float,
-        repeats: int, precomputed_scale: float) -> None:
+def _scan_bounds(gcode_path: str):
+    """Return (x_min, x_max, y_min, y_max) at scale=1.0."""
+    x_vals, y_vals = [], []
+    with open(gcode_path) as fh:
+        for line in fh:
+            for ch in ('(', ';', '%'):
+                if ch in line:
+                    line = line[:line.find(ch)]
+            parts = line.split()
+            if not parts or parts[0] not in ('G0', 'G00', 'G1', 'G01'):
+                continue
+            for p in parts[1:]:
+                if p.startswith('X'):
+                    try: x_vals.append(float(p[1:]))
+                    except ValueError: pass
+                elif p.startswith('Y'):
+                    try: y_vals.append(float(p[1:]))
+                    except ValueError: pass
+    if not x_vals or not y_vals:
+        return 0.0, 1.0, 0.0, 1.0
+    return min(x_vals), max(x_vals), min(y_vals), max(y_vals)
 
-    lease_client = robot.ensure_client(LeaseClient.default_service_name)
+
+def compute_scale(gcode_path: str, canvas, margin: float = 0.90) -> float:
+    """Return scale (m/unit) that fits gcode within margin fraction of the canvas."""
+    x_min, x_max, y_min, y_max = _scan_bounds(gcode_path)
+    gw = x_max - x_min
+    gh = y_max - y_min
+    if gw <= 0 or gh <= 0:
+        print("  [WARN] Cannot determine gcode extents — using 0.001 m/unit")
+        return 0.001
+    cw    = (canvas.width_mm  / 1000.0) * margin
+    ch    = (canvas.height_mm / 1000.0) * margin
+    scale = min(cw / gw, ch / gh)
+    cx    = (x_min + x_max) / 2.0
+    cy    = (y_min + y_max) / 2.0
+    print(f"  Gcode extents  {gw:.1f} × {gh:.1f} raw units  (center {cx:.1f}, {cy:.1f})")
+    print(f"  Canvas         {canvas.width_mm:.0f} × {canvas.height_mm:.0f} mm"
+          f"  (margin {margin*100:.0f}%)")
+    print(f"  Auto-scale     {scale:.6f} m/unit"
+          f"  →  drawing {gw*scale*1000:.0f} × {gh*scale*1000:.0f} mm  (centered)")
+    return scale
+
+
+def _rotation_matrix(q) -> np.ndarray:
+    """Build 3×3 rotation matrix from (qx, qy, qz, qw)."""
+    qx, qy, qz, qw = q
+    return np.array([
+        [1 - 2*(qy**2 + qz**2),   2*(qx*qy - qz*qw),   2*(qx*qz + qy*qw)],
+        [  2*(qx*qy + qz*qw), 1 - 2*(qx**2 + qz**2),   2*(qy*qz - qx*qw)],
+        [  2*(qx*qz - qy*qw),   2*(qy*qz + qx*qw), 1 - 2*(qx**2 + qy**2)],
+    ], dtype=float)
+
+
+# ---------------------------------------------------------------------------
+# Pre-draw body positioning: walk until canvas centre is at ideal arm distance
+# ---------------------------------------------------------------------------
+
+def _walk_arm_to_canvas_center(vicon_client, cmd_client) -> bool:
+    """
+    Walk the robot body (forward/lateral, no rotation) so the canvas centre
+    sits at _ARM_REACH_IDEAL_MM directly in front of the arm.
+    Once within tolerance the base is stopped and drawing proceeds locked.
+    Returns False only if estop fires.
+    """
+    _SPEED   = 0.20   # m/s — slow and controlled
+    _CMD_DUR = 0.4    # s per velocity burst
+
+    print("  Positioning body so arm reaches canvas centre…", flush=True)
+
+    for _ in range(120):   # max ~12 s
+        if not _ctrl.check():
+            return False
+
+        frame = vicon_client.latest_frame
+        if (frame is None or frame.canvas is None or not frame.canvas.is_valid()
+                or frame.spot_body is None or frame.spot_body.occluded):
+            time.sleep(0.1)
+            continue
+
+        center_mm  = np.mean(np.array(frame.canvas.corners), axis=0)
+        robot_mm   = np.array(frame.spot_body.position)
+        delta_mm   = center_mm - robot_mm
+        R          = _rotation_matrix(frame.spot_body.rotation_quat)   # world←body
+        delta_body = R.T @ delta_mm                                     # body frame mm
+
+        fwd_err = float(delta_body[0]) - _ARM_REACH_IDEAL_MM   # +ve → too far, step fwd
+        lat_err = float(delta_body[1])                          # +ve → centre is left
+
+        if abs(fwd_err) < _ARM_REACH_TOL_MM and abs(lat_err) < _ARM_REACH_TOL_MM / 2:
+            cmd_client.robot_command(
+                RobotCommandBuilder.synchro_velocity_command(0, 0, 0),
+                end_time_secs=time.time() + 0.3)
+            print(f"  Body locked: canvas centre at "
+                  f"({float(delta_body[0]):.0f}, {float(delta_body[1]):.0f}) mm body",
+                  flush=True)
+            return True
+
+        # Normalise and scale velocity in body frame (v_x=fwd, v_y=left)
+        mag  = _math.sqrt(fwd_err**2 + lat_err**2)
+        v_x  = float(np.clip(fwd_err / mag * _SPEED, -_SPEED, _SPEED))
+        v_y  = float(np.clip(lat_err / mag * _SPEED, -_SPEED, _SPEED))
+
+        cmd_client.robot_command(
+            RobotCommandBuilder.synchro_velocity_command(v_x, v_y, 0),
+            end_time_secs=time.time() + _CMD_DUR)
+        time.sleep(0.1)
+
+    print("  [WARN] Body positioning timed out — drawing from current position",
+          flush=True)
+    return _ctrl.check()
+
+
+# ---------------------------------------------------------------------------
+# _draw_file — touch-to-find-ground + execute gcode
+# Same mechanism as gcode_manual/gcode.py, adapted for key-listener controls.
+# Key listener must be running (SPACE=estop, ENTER=confirm).
+# Returns True on success, False if estop fired.
+# ---------------------------------------------------------------------------
+
+def _draw_file(gcode_file: str, scale: float, vicon_client,
+               state_client, cmd_client, asc_client,
+               robot_logger, cfg: dict) -> bool:
+
+    tool_length      = cfg['tool_length']
+    allow_walking    = cfg['allow_walking']
+    velocity         = cfg['velocity']
+    press_force_pct  = cfg['press_force_pct']
+    below_z_adm      = cfg['below_z_adm']
+    travel_z         = cfg['travel_z']
+    draw_z_offset    = cfg['draw_z_offset']
+    min_dist_to_goal = cfg['min_dist_to_goal']
+    draw_on_wall     = cfg['draw_on_wall']
+    use_vision_frame = cfg['use_vision_frame']
+    use_xy_cross     = cfg['use_xy_cross']
+    bias_force_x     = cfg['bias_force_x']
+    api_send_frame   = VISION_FRAME_NAME if use_vision_frame else ODOM_FRAME_NAME
+
+    # Proto identity transform used by ArmSurfaceContact
+    vision_T_admittance = geometry_pb2.SE3Pose(
+        position=geometry_pb2.Vec3(x=0, y=0, z=0),
+        rotation=geometry_pb2.Quaternion(w=1, x=0, y=0, z=0),
+    )
+
+    wr1_T_tool = SE3Pose(0.23589 + tool_length, 0, 0, Quat(w=1, x=0, y=0, z=0))
+
+    # ── Center the gcode around its bounding box midpoint ────────────────
+    # This ensures gcode (0,0) in origin frame = center of the drawing,
+    # so the drawing is centered wherever the arm touches down.
+    x_min, x_max, y_min, y_max = _scan_bounds(gcode_file)
+    gcode_start_x = (x_min + x_max) / 2.0
+    gcode_start_y = (y_min + y_max) / 2.0
+    robot_logger.info('Gcode center offset: (%.1f, %.1f)', gcode_start_x, gcode_start_y)
+
+    gcode = GcodeReader(gcode_file, tool_length, scale, robot_logger,
+                        below_z_adm, travel_z, draw_on_wall,
+                        gcode_start_x, gcode_start_y, draw_z_offset)
+
+    # ── Walk body so canvas centre is at ideal arm distance, then lock base ─
+    if not _walk_arm_to_canvas_center(vicon_client, cmd_client):
+        return False
+
+    # ── Move arm directly above canvas centre (arm_y=0: walk already corrects lateral) ──
+    robot_state = state_client.get_robot_state()
+    flat_body_T_hand = SE3Pose(_ARM_REACH_IDEAL_MM / 1000.0, 0.0, -0.45,
+                                Quat(w=0.707, x=0, y=0.707, z=0))
+    (_, odom_T_flat_body, _, _, _, _) = get_transforms(False, robot_state)
+    odom_T_hand = odom_T_flat_body * flat_body_T_hand
+    p = odom_T_hand.to_proto()
+
+    robot_logger.info('Moving arm to canvas centre…')
+    arm_cmd = RobotCommandBuilder.arm_pose_command(
+        p.position.x, p.position.y, p.position.z,
+        p.rotation.w, p.rotation.x, p.rotation.y, p.rotation.z,
+        ODOM_FRAME_NAME, 0.000001,
+    )
+    cmd_client.robot_command(RobotCommandBuilder.build_synchro_command(arm_cmd))
+    if not _ctrl.sleep(3.0):   # waits up to 3 s, checking estop every 50 ms
+        return False
+
+    # ── Confirm before touching down ──────────────────────────────────────
+    if not _ctrl.wait_confirm(
+            f"File: {os.path.basename(gcode_file)}\n"
+            "  Arm is in position. Press ENTER to touch down and begin drawing."):
+        return False
+
+    # ── Touch-to-find-ground ──────────────────────────────────────────────
+    robot_state = state_client.get_robot_state()
+    snap = robot_state.kinematic_state.transforms_snapshot
+
+    vision_T_wr1  = get_a_tform_b(snap, VISION_FRAME_NAME, WR1_FRAME_NAME)
+    vision_T_tool = vision_T_wr1 * wr1_T_tool
+
+    robot_logger.info('Pressing marker down to find surface…')
+    move_arm(robot_state, True, [vision_T_tool], asc_client, cmd_client, 0.04,
+             allow_walking, vision_T_admittance, press_force_pct,
+             api_send_frame, use_xy_cross, bias_force_x)
+    if not _ctrl.sleep(8.0):   # wait for surface contact; checks estop every 50 ms
+        return False
+
+    # ── Re-read state after touchdown ─────────────────────────────────────
+    robot_state = state_client.get_robot_state()
+    (vision_T_body, _, body_T_hand, _, _, odom_T_body) = get_transforms(True, robot_state)
+    snap = robot_state.kinematic_state.transforms_snapshot
+
+    odom_T_ground = get_a_tform_b(snap, ODOM_FRAME_NAME, GROUND_PLANE_FRAME_NAME)
+    vision_T_odom = vision_T_body * odom_T_body.inverse()
+    gx, gy, gz = vision_T_odom.transform_point(
+        odom_T_ground.x, odom_T_ground.y, odom_T_ground.z)
+    ground_plane_rt_vision = [gx, gy, gz]
+
+    vision_T_wr1  = get_a_tform_b(snap, VISION_FRAME_NAME, WR1_FRAME_NAME, validate=True)
+    vision_T_tool = vision_T_wr1 * wr1_T_tool
+    ground_plane_rt_vision[2] = vision_T_tool.z   # pin Z to actual touch point
+
+    # ── Set gcode origin at the ACTUAL TOUCH POINT ────────────────────────
+    #
+    # Position = vision_T_tool (where the arm physically touched the canvas).
+    # After _walk_arm_to_canvas_center + arm positioning, this is at canvas centre.
+    # Using the real touch point avoids all Vicon↔SDK coordinate-frame mismatch.
+    #
+    # Orientation: walk_to_canvas aligns the robot to face +canvas_x_axis, so
+    # body-forward == canvas x_axis after navigation.  We project body-forward
+    # onto the horizontal plane and enforce z=[0,0,1] so the arm points straight
+    # down throughout (no tilt) — identical to gcode_manual/gcode.py set_origin().
+    #
+    # gcode +X  = body forward  = canvas TL→TR  (width direction)
+    # gcode +Y  = body left     = canvas TL→BL  (height direction)
+    # gcode(0,0)= canvas centre (gcode_start_x/y = bounding-box centre above)
+    zhat = np.array([0.0, 0.0, 1.0])
+    bfwd = list(vision_T_body.rot.transform_point(1.0, 0.0, 0.0))
+    xhat = make_orthogonal(zhat, bfwd)    # body forward projected to horizontal
+    yhat = np.cross(zhat, xhat)            # body left, horizontal
+    rot_mat = np.column_stack([xhat, yhat, zhat])
+
+    gcode.vision_T_origin = SE3Pose(vision_T_tool.x, vision_T_tool.y, vision_T_tool.z,
+                                     Quat.from_matrix(rot_mat))
+    robot_logger.info('Origin at touch point (%.3f, %.3f, %.3f)  body-fwd=(%.3f,%.3f)',
+                      vision_T_tool.x, vision_T_tool.y, vision_T_tool.z,
+                      xhat[0], xhat[1])
+
+    # ── Lift arm to travel height before starting gcode loop ──────────────
+    touch_z = vision_T_tool.z
+    tp = vision_T_tool.to_proto()
+    lift_cmd = RobotCommandBuilder.arm_pose_command(
+        tp.position.x, tp.position.y, touch_z + travel_z,
+        tp.rotation.w, tp.rotation.x, tp.rotation.y, tp.rotation.z,
+        VISION_FRAME_NAME, 2.0)
+    cmd_client.robot_command(RobotCommandBuilder.build_synchro_command(lift_cmd))
+    if not _ctrl.sleep(2.5):
+        return False
+
+    # ── Execute gcode loop ────────────────────────────────────────────────
+    (is_admittance, vision_T_goals, is_pause) = \
+        gcode.get_next_vision_T_goals(ground_plane_rt_vision)
+
+    while is_pause:
+        if not _ctrl.wait_confirm("M0 pause — press ENTER to continue."):
+            return False
+        (is_admittance, vision_T_goals, is_pause) = \
+            gcode.get_next_vision_T_goals(ground_plane_rt_vision)
+
+    if vision_T_goals is None:
+        robot_logger.info('Gcode file is empty.')
+        return True
+
+    if not _ctrl.check():
+        return False
+
+    move_arm(robot_state, is_admittance, vision_T_goals, asc_client, cmd_client, velocity,
+             allow_walking, vision_T_admittance, press_force_pct,
+             api_send_frame, use_xy_cross, bias_force_x)
+    odom_T_hand_goal = vision_T_odom.inverse() * vision_T_goals[-1]
+    last_admittance  = is_admittance
+
+    while True:
+        if not _ctrl.check():
+            return False
+
+        robot_state = state_client.get_robot_state()
+        (vision_T_body, _, body_T_hand, _, _, odom_T_body) = get_transforms(True, robot_state)
+        vision_T_odom = vision_T_body * odom_T_body.inverse()
+        ground_plane_rt_vision[0], ground_plane_rt_vision[1] = (
+            vision_T_odom.transform_point(
+                odom_T_ground.x, odom_T_ground.y, odom_T_ground.z)[:2]
+        )
+
+        adm_inv     = SE3Pose.from_proto(vision_T_admittance).inverse()
+        hand_in_adm = adm_inv * vision_T_odom * odom_T_body * body_T_hand
+        goal_in_adm = adm_inv * vision_T_odom * odom_T_hand_goal
+
+        if is_admittance:
+            dist = _math.sqrt((hand_in_adm.x - goal_in_adm.x)**2 +
+                              (hand_in_adm.y - goal_in_adm.y)**2)
+        else:
+            dist = _math.sqrt((hand_in_adm.x - goal_in_adm.x)**2 +
+                              (hand_in_adm.y - goal_in_adm.y)**2 +
+                              (hand_in_adm.z - goal_in_adm.z)**2)
+
+        if dist < min_dist_to_goal:
+            (is_admittance, vision_T_goals, is_pause) = \
+                gcode.get_next_vision_T_goals(ground_plane_rt_vision)
+
+            while is_pause:
+                if not _ctrl.wait_confirm("M0 pause — press ENTER to continue."):
+                    return False
+                (is_admittance, vision_T_goals, is_pause) = \
+                    gcode.get_next_vision_T_goals(ground_plane_rt_vision)
+
+            if vision_T_goals is None:
+                robot_logger.info('Gcode program finished.')
+                # 1. Lift off paper so the marker doesn't drag during stow.
+                robot_state = state_client.get_robot_state()
+                vt_wr1  = get_a_tform_b(
+                    robot_state.kinematic_state.transforms_snapshot,
+                    VISION_FRAME_NAME, WR1_FRAME_NAME)
+                vt_tool = vt_wr1 * wr1_T_tool
+                ep = vt_tool.to_proto()
+                lift = RobotCommandBuilder.arm_pose_command(
+                    ep.position.x, ep.position.y, touch_z + travel_z,
+                    ep.rotation.w, ep.rotation.x, ep.rotation.y, ep.rotation.z,
+                    VISION_FRAME_NAME, 2.0)
+                cmd_client.robot_command(
+                    RobotCommandBuilder.build_synchro_command(lift))
+                _ctrl.sleep(2.0)
+                # 2. Stow arm fully before returning — callers must not need to stow.
+                robot_logger.info('Stowing arm…')
+                try:
+                    cmd_client.robot_command(RobotCommandBuilder.arm_stow_command())
+                except Exception:
+                    pass
+                _ctrl.sleep(4.0)   # stow from extended position takes ~3-4 s
+                return True
+
+            if not _ctrl.check():
+                return False
+
+            move_arm(robot_state, is_admittance, vision_T_goals, asc_client, cmd_client,
+                     velocity, allow_walking, vision_T_admittance, press_force_pct,
+                     api_send_frame, use_xy_cross, bias_force_x)
+            odom_T_hand_goal = vision_T_odom.inverse() * vision_T_goals[-1]
+
+            if is_admittance != last_admittance:
+                _ctrl.sleep(3.0 if is_admittance else 1.0)
+            last_admittance = is_admittance
+
+        elif not is_admittance:
+            (is_admittance, vision_T_goals, is_pause) = \
+                gcode.get_next_vision_T_goals(ground_plane_rt_vision, read_new_line=False)
+
+        time.sleep(0.05)
+
+
+# ---------------------------------------------------------------------------
+# Emergency-stop cleanup helper
+# ---------------------------------------------------------------------------
+
+def _do_estop_cleanup(cmd_client) -> None:
+    print("\n[ESTOP] Stowing arm and sitting…")
+    try:
+        cmd_client.robot_command(RobotCommandBuilder.arm_stow_command())
+        time.sleep(4)   # stow from extended position takes ~3-4 s
+        cmd_client.robot_command(RobotCommandBuilder.synchro_sit_command())
+        time.sleep(2)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
+
+def run(vicon_client, robot) -> None:
     cmd_client   = robot.ensure_client(RobotCommandClient.default_service_name)
     state_client = robot.ensure_client(RobotStateClient.default_service_name)
-    estop_client = robot.ensure_client(EstopClient.default_service_name)
     asc_client   = robot.ensure_client(ArmSurfaceContactClient.default_service_name)
+    lease_client = robot.ensure_client(LeaseClient.default_service_name)
+    estop_client = robot.ensure_client(EstopClient.default_service_name)
 
     estop_ep = EstopEndpoint(estop_client, name="draw_gcode_estop", estop_timeout=9.0)
     estop_ep.force_simple_setup()
 
-    with (
-        EstopKeepAlive(estop_ep),
-        LeaseKeepAlive(lease_client, must_acquire=True, return_at_exit=True),
-    ):
-        # ── 1. Stand up ───────────────────────────────────────────────────
+    cfg = _load_cfg()
+
+    with EstopKeepAlive(estop_ep), \
+         LeaseKeepAlive(lease_client, must_acquire=True, return_at_exit=True):
+
+        # ── Stand up ──────────────────────────────────────────────────────
         print("Standing up…")
         robot.power_on(timeout_sec=20)
         blocking_stand(cmd_client, timeout_sec=10)
         print("Robot standing.\n")
-        print(f"  SPACE = emergency stop (stow + sit)")
-        print(f"  ENTER = confirm marker placement\n")
-
+        print("  SPACE / ESC = emergency stop")
+        print("  ENTER       = confirm")
+        print("  x           = sit and exit when prompted\n")
         _ctrl.start_key_listener()
 
-        for rep in range(repeats):
+        # ── Walk to canvas ─────────────────────────────────────────────────
+        print("─── Walk to canvas")
+        if not walk_to_canvas(cmd_client, vicon_client):
+            _do_estop_cleanup(cmd_client)
+            return
+
+        # ── Place marker ───────────────────────────────────────────────────
+        print("\n─── Place marker")
+        if not open_for_marker(cmd_client):
+            _do_estop_cleanup(cmd_client)
+            return
+
+        # ── Drawing loop ───────────────────────────────────────────────────
+        while True:
             if not _ctrl.check():
                 break
 
-            if repeats > 1:
-                print(f"\n{'━' * 52}")
-                print(f"  Repetition {rep + 1} / {repeats}")
-                print(f"{'━' * 52}\n")
+            # Select gcode — stop key listener so input() works normally
+            print("\n─── Select gcode")
+            _ctrl.stop_key_listener()
+            os.makedirs(G_CODES_DIR, exist_ok=True)
+            gcode_path = select_gcode()
 
-            # ── 2. Walk to canvas ─────────────────────────────────────────
-            print("─── Step 1 / 4  Walk to canvas")
-            if not walk_to_canvas(cmd_client, vicon_client):
-                break
+            # Compute auto-scale from Vicon canvas
+            frame = vicon_client.latest_frame
+            if frame and frame.canvas and frame.canvas.is_valid():
+                print("  Computing auto-scale from canvas…")
+                scale = compute_scale(gcode_path, frame.canvas)
+            else:
+                print("  [WARN] Canvas not visible — using default scale 0.001 m/unit")
+                scale = 0.001
+
+            _ctrl.start_key_listener()
+
             if not _ctrl.check():
                 break
 
-            # ── 3. Place marker ───────────────────────────────────────────
-            print("\n─── Step 2 / 4  Marker placement")
-            if not open_for_marker(cmd_client):
-                break
-            if not _ctrl.check():
-                break
+            # ── Draw ────────────────────────────────────────────────────
+            print(f"\n─── Drawing: {os.path.basename(gcode_path)}")
+            ok = _draw_file(gcode_path, scale, vicon_client,
+                            state_client, cmd_client, asc_client,
+                            robot.logger, cfg)
 
-            # ── 4. Draw pose ──────────────────────────────────────────────
-            print("\n─── Step 3 / 4  Draw pose")
-            if not move_to_draw_pose(cmd_client, vicon_client):
-                break
-            if not _ctrl.check():
-                break
-
-            # ── 5. Draw ───────────────────────────────────────────────────
-            print("\n─── Step 4 / 4  Drawing")
+            # ── Stow arm after drawing ───────────────────────────────────
+            # _draw_file already stows on success; this is a safety fallback
+            # for the estop / error path where it returned early.
+            print("\n  Stowing arm…")
             try:
-                gcode_execute(
-                    vicon_client, asc_client, cmd_client, state_client,
-                    gcode_path,
-                    scale=precomputed_scale,
-                    tool_length=tool_length,
-                )
-            except RuntimeError as exc:
-                print(f"\n  [ERROR] {exc}")
+                cmd_client.robot_command(RobotCommandBuilder.arm_stow_command())
+                time.sleep(4)   # stow from extended position takes ~3-4 s
+            except Exception:
+                pass
+            blocking_stand(cmd_client, timeout_sec=10)
+
+            if not ok or not _ctrl.check():
                 break
 
-        # ── Clean exit ────────────────────────────────────────────────────
+            # ── "Draw another?" — stop key listener for input() ──────────
+            _ctrl.stop_key_listener()
+            print()
+            print("┌─────────────────────────────────────────┐")
+            print("│  Drawing complete.                      │")
+            print("│  Draw another file?  [y/N]              │")
+            print("└─────────────────────────────────────────┘")
+            ans = input("> ").strip().lower()
+            if ans != 'y':
+                _ctrl.start_key_listener()
+                break
+
+            print()
+            print("  Change marker?  [y/N]")
+            change_marker = input("> ").strip().lower() == 'y'
+            _ctrl.start_key_listener()
+
+            if change_marker:
+                print("\n─── Change marker")
+                if not open_for_marker(cmd_client):
+                    break
+
+            # Loop back to gcode selection
+
+        # ── Sit and exit ───────────────────────────────────────────────────
         print("\nCleaning up — stowing arm and sitting…")
         try:
             cmd_client.robot_command(RobotCommandBuilder.arm_stow_command())
@@ -184,25 +639,19 @@ def run(vicon_client, robot, gcode_path: str, tool_length: float,
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    import argparse
     ap = argparse.ArgumentParser(
-        description="draw_gcode — autonomous walk + manual marker + gcode drawing",
+        description="draw_gcode — autonomous walk + marker grab + gcode drawing",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     ap.add_argument("--vicon", metavar="HOST:PORT",
-                    help=f"Vicon address (default: from .env = {VICON_ADDRESS})")
-    ap.add_argument("--tool-length", type=float, default=0.0,
-                    help="Marker/brush length beyond the wrist (metres)")
-    ap.add_argument("--repeats", type=int, default=1,
-                    help="Number of full draw cycles")
-    ap.add_argument("--margin", type=float, default=0.90,
-                    help="Canvas fill fraction for auto-scale (0–1)")
+                    help=f"Vicon address (default from .env: {VICON_ADDRESS})")
     args = ap.parse_args()
 
     vicon_addr = args.vicon or VICON_ADDRESS
     if not vicon_addr:
         raise SystemExit("No VICON_HOST set and --vicon not specified.")
 
-    # ── Connect Vicon first (needed to preview auto-scale) ────────────────
     print(f"Connecting to Vicon at {vicon_addr}…")
     vicon = ViconClient(host=vicon_addr)
     vicon.start()
@@ -213,28 +662,16 @@ def main() -> None:
         raise SystemExit(f"No Vicon frames after {VICON_CONNECT_TO:.0f} s.")
 
     frame = vicon.latest_frame
-    canvas_ok = frame.canvas is not None and frame.canvas.is_valid()
-    spot_ok   = frame.spot_body is not None and not frame.spot_body.occluded
-
-    print(f"Vicon OK  |  canvas: {'OK' if canvas_ok else 'NO DATA'}"
-          f"  |  spot_base: {'OK' if spot_ok else 'NO DATA'}")
-
-    if not canvas_ok:
+    if frame.canvas is None or not frame.canvas.is_valid():
         vicon.stop()
         raise SystemExit("Canvas not visible — check test_canvas markers in Vicon Tracker.")
+
+    spot_ok = frame.spot_body is not None and not frame.spot_body.occluded
+    print(f"Vicon OK  |  canvas {frame.canvas.width_mm:.0f} × {frame.canvas.height_mm:.0f} mm"
+          f"  |  spot_base: {'OK' if spot_ok else 'NO DATA'}\n")
     if not spot_ok:
         print("[WARN] spot_base not visible — navigation will wait for it.\n")
 
-    # ── Select gcode file (uses normal input(), before key listener) ───────
-    os.makedirs(G_CODES_DIR, exist_ok=True)
-    gcode_path = select_gcode()
-
-    # ── Pre-compute scale from canvas now (shows preview before Spot connect) ─
-    print("Computing auto-scale…")
-    scale = compute_canvas_scale(gcode_path, frame.canvas, margin=args.margin)
-    print()
-
-    # ── Connect Spot ──────────────────────────────────────────────────────
     print("Connecting to Spot…")
     bosdyn.client.util.setup_logging(verbose=False)
     sdk   = bosdyn.client.create_standard_sdk("DrawGcode")
@@ -244,7 +681,7 @@ def main() -> None:
     print("Spot connected.\n")
 
     try:
-        run(vicon, robot, gcode_path, args.tool_length, args.repeats, scale)
+        run(vicon, robot)
     finally:
         vicon.stop()
 
