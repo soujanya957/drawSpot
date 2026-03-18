@@ -12,11 +12,10 @@ Copy `.env.example` to `.env` and fill in your credentials:
 
 ```bash
 cp .env.example .env
-# edit .env with your SPOT_IP, SPOT_USER, SPOT_PASSWORD, VICON_HOST, VICON_PORT
-export $(cat .env | xargs)
+# edit .env with ROBOT_IP, USERNAME, PASSWORD, VICON_ADDRESS
 ```
 
-Or use [direnv](https://direnv.net/) to load automatically on `cd`:
+Or use [direnv](https://direnv.net/):
 ```bash
 echo 'dotenv' > .envrc && direnv allow
 ```
@@ -27,63 +26,47 @@ echo 'dotenv' > .envrc && direnv allow
 
 ```
 config/
-  robot_config.py       # loads SPOT_IP, SPOT_USER, SPOT_PASSWORD, VICON_HOST from env
+  robot_config.py       # loads credentials from env
 
-vicon/                  # shared Vicon library — used by draw/, src/, and tests/
-  client.py             # ViconClient (real DataStream) + MockViconClient
-  transform.py          # world ↔ canvas UV coordinate transforms
-  types.py              # ViconFrame, CanvasFrame, RigidBody, Marker dataclasses
+vicon/                  # shared Vicon library
+  client.py             # ViconClient + MockViconClient
+  types.py              # ViconFrame, CanvasFrame, RigidBody dataclasses
 
-draw/                   # web UI canvas draw (mouse pen-up / pen-down via Vicon)
-  main.py               # entry point: wires Vicon + robot controller + web UI
+draw_gcode/             # main drawing pipeline (Vicon-guided gcode)
+  main.py               # entry point
+  gcode.cfg             # tuning parameters (force, velocity, z offsets)
+  g_codes/              # place .gcode / .nc files here
   robot/
-    controller.py       # translates canvas UV coords to Spot arm commands
-    state.py            # robot state machine (IDLE / AUTONOMOUS / TELEOP / ESTOP)
-  ui/
-    server.py           # FastAPI/WebSocket server
-    static/             # browser canvas (index.html + app.js)
+    navigator.py        # walk_to_canvas, open_for_marker, move_to_draw_pose
+  _ctrl.py              # emergency stop + key listener
 
-draw_autonomous/        # fully autonomous gcode drawing pipeline (no web UI)
-  main.py               # entry point: walk→pick brush→walk→draw, repeatable
-  robot/
-    navigator.py        # walk_to, pick_brush, move_to_draw_pose
-    gcode_draw.py       # GcodeReader, move_arm, draw_gcode execution loop
-  _ctrl.py              # shared pause/estop events and key listener
+draw/                   # web UI canvas draw (mouse → arm)
+draw_autonomous/        # gcode drawing without web UI
+gcode_manual/           # manual gcode execution primitives
+gcode_vicon/            # Vicon-referenced gcode execution
 
 src/
-  teleop/               # manual teleoperation scripts (no Vicon required)
-    full_control.py     # base + arm + gripper + pick (all-in-one, recommended)
+  teleop/               # manual teleoperation
+    full_control.py     # base + arm + gripper (all-in-one, recommended)
     teleop_base.py      # base movement only
     teleop_arm.py       # arm only
-    teleop_full.py      # base + arm (no gripper/pick)
-    canvas_draw.py      # mouse-drag → arm draws on physical canvas
+    teleop_full.py      # base + arm (no gripper)
+    canvas_draw.py      # mouse-drag → arm draws on canvas
     pick_object.py      # click-to-grasp from hand camera
 
-  vicon/                # Vicon-driven positioning and drawing scripts
-    vicon_draw.py         # teleop + live Vicon status + web UI canvas draw
-    vicon_draw_auto.py    # autonomous: walk → pick brush → walk → draw pattern
-    vicon_base_follow.py  # Vicon body displacement → base walks to match
-    vicon_ee_follow.py    # Vicon marker position → arm end-effector follows
-
-tests/                  # standalone validation scripts (run in order)
-  test_vicon.py         # layer 0: Vicon connection + live data for all subjects
-  test_nav.py           # layer 1: walk Spot to brush or canvas, stop at standoff
-  test_draw.py          # layer 2: validate arm drawing from pattern JSON (no walking)
-  test_gcode.py         # layer 3: draw from a .gcode file using Vicon canvas as origin
-
-patterns/               # drawing pattern files (UV strokes JSON)
-  square.json           # square outline with diagonals
-  cross.json            # plus sign
-  spiral.json           # Archimedean spiral
+tests/
+  test_draw_gcode.py    # staged pipeline tests (vicon / nav / marker / draw / full)
+  probe_vicon.py        # quick Vicon connection check
 ```
 
 ---
 
 ## Running
 
-**Autonomous drawing** (Vicon + web UI):
+**Full autonomous draw** (main pipeline):
 ```bash
-python -m draw.main --vicon 192.168.1.10:801
+python -m draw_gcode.main --vicon <VICON_IP>:801
+python -m draw_gcode.main --vicon <VICON_IP>:801 --repeats 2
 ```
 
 **Manual teleop** (all controls):
@@ -91,90 +74,36 @@ python -m draw.main --vicon 192.168.1.10:801
 python -m src.teleop.full_control
 ```
 
-**Vicon draw** (full teleop + live positions + canvas draw mode):
+**Key bindings (all robot stages):**
+- `SPACE` — emergency stop (stow + sit immediately)
+- `ENTER` — confirm prompt (marker placement)
+- `x` — sit and exit after a stage completes
+
+---
+
+## Staged tests
+
+Run in order — see `draw_gcode_checklist.md` for full pass criteria.
+
 ```bash
-python -m src.vicon.vicon_draw
-# override Vicon address:
-python -m src.vicon.vicon_draw --vicon 192.168.10.1:801
-# without Vicon hardware (mock):
-python -m src.vicon.vicon_draw --mock
-```
+# Check Vicon only (no Spot required)
+python -m tests.test_draw_gcode --stage vicon  --vicon <VICON_IP>:801
 
-Connects to Spot first, then tries Vicon (5 s timeout). If Vicon is unavailable or
-`VICON_HOST` is not set, the script continues in teleop-only mode — draw mode (`d` key)
-is disabled until Vicon data arrives.
+# Walk Spot to canvas standoff
+python -m tests.test_draw_gcode --stage nav    --vicon <VICON_IP>:801
 
-**Autonomous draw** (walk → pick brush → walk → draw pattern):
-```bash
-python -m src.vicon.vicon_draw_auto patterns/square.json
-python -m src.vicon.vicon_draw_auto patterns/spiral.json --repeats 3
-# SPACE = pause/resume   RETURN = emergency stop (stow + sit)
-```
+# Open gripper and wait for marker placement
+python -m tests.test_draw_gcode --stage marker --vicon <VICON_IP>:801
 
-Pattern JSON format — each stroke is a list of `[u, v]` points (pen down for the full stroke, pen lifts between strokes):
-```json
-{
-  "brush_world_mm": [500, 200, 50],
-  "strokes": [
-    [[0.2, 0.2], [0.8, 0.2], [0.8, 0.8], [0.2, 0.8], [0.2, 0.2]],
-    [[0.2, 0.2], [0.8, 0.8]]
-  ]
-}
-```
+# Execute gcode (arm assumed already near canvas)
+python -m tests.test_draw_gcode --stage draw   --vicon <VICON_IP>:801
 
-**Fully autonomous gcode draw** (walk → pick brush → walk → draw):
-```bash
-python -m draw_autonomous.main my_drawing.gcode
-python -m draw_autonomous.main my_drawing.gcode --scale 0.001   # gcode in mm (default)
-python -m draw_autonomous.main my_drawing.gcode --repeats 3
-python -m draw_autonomous.main my_drawing.gcode --mock
-# SPACE = pause/resume   RETURN = emergency stop (stow + sit)
-```
-
-**Vicon EE follow test**:
-```bash
-python -m src.vicon.vicon_ee_follow --vicon 192.168.1.10:801
+# Full pipeline: nav → marker → draw
+python -m tests.test_draw_gcode --stage full   --vicon <VICON_IP>:801
 ```
 
 ---
 
-## Test scripts
+## Networking
 
-Run these in order — each layer builds on the one before it. See `TESTING.md` for the full checklist.
-
-**Layer 0 — Vicon connection** (no Spot required):
-```bash
-python -m tests.test_vicon                          # all subjects, live refresh
-python -m tests.test_vicon --target spot_body       # Spot body only
-python -m tests.test_vicon --target spot_ee         # end-effector only
-python -m tests.test_vicon --target brush_tip       # brush marker only
-python -m tests.test_vicon --target canvas          # canvas corners + axes
-python -m tests.test_vicon --once                   # print one frame and exit
-python -m tests.test_vicon --mock                   # no hardware
-```
-
-**Layer 1 — Navigation test** — walk Spot to brush or canvas and stop at standoff distance:
-```bash
-python -m tests.test_nav --target brush
-python -m tests.test_nav --target canvas
-python -m tests.test_nav --target 500,200,0   # world XYZ in mm
-```
-
-**Draw validation** — arm already at canvas, execute a pattern JSON:
-```bash
-python -m tests.test_draw patterns/square.json
-python -m tests.test_draw patterns/spiral.json --speed 0.5
-python -m tests.test_draw patterns/square.json --mock
-```
-Pre-validates all waypoints for IK reachability before starting.
-
-**Gcode draw** — draw from a `.gcode` file using the Vicon canvas as the coordinate origin:
-```bash
-python -m tests.test_gcode my_drawing.gcode
-python -m tests.test_gcode my_drawing.gcode --scale 0.001   # gcode in mm (default)
-python -m tests.test_gcode my_drawing.gcode --scale 1.0     # gcode in metres
-python -m tests.test_gcode my_drawing.gcode --mock
-```
-Uses `ArmSurfaceContact` for force-compliant drawing. Canvas TL corner and axes from Vicon replace the touch-to-find-ground step. Generate gcode from Inkscape via Extensions → Gcodetools → Path to Gcode, or any CAM tool that outputs G00/G01/G02/G03.
-
-All test scripts: `SPACE` = pause/resume, `RETURN` = emergency stop (stow + sit).
+If Vicon is unreachable, see `FAQ.md` for the ARP fix and `fixes.md` for the per-session route command.
