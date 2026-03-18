@@ -153,7 +153,7 @@ def _stow(cmd_client) -> None:
     print("  Stowing arm…")
     try:
         cmd_client.robot_command(RobotCommandBuilder.arm_stow_command())
-        time.sleep(2)
+        time.sleep(4)   # stow from extended position takes ~3-4 s
     except Exception:
         pass
     print("  Arm stowed. Robot still standing.")

@@ -8,8 +8,12 @@ replace the touch-to-find-ground step in the original gcode.py.
 Public API
 ----------
   build_canvas_origin(frame)            -> SE3Pose   (odom frame)
-  draw_gcode(vicon_client, robot, asc_client, cmd_client, state_client,
+  draw_gcode(vicon_client, asc_client, cmd_client, state_client,
              gcode_path, scale, tool_length)          -> None
+  draw_gcode_vicon(vicon_client, asc_client, cmd_client, state_client,
+                   gcode_path, tool_length, margin)   -> None
+  draw_gcode_manual(asc_client, cmd_client, state_client,
+                    gcode_path, scale, tool_length, origin_x/y/z, ...) -> None
 
 GcodeReader, move_arm, and get_transforms are inlined — no spot-sdk path dependency.
 """
@@ -428,7 +432,10 @@ def _draw_gcode_impl(asc_client, cmd_client, state_client,
     robot_state = state_client.get_robot_state()
     (_, odom_T_flat_body, _, _, _, _) = get_transforms(False, robot_state)
 
-    flat_body_T_hand  = SE3Pose(0.75, 0, -0.35, Quat(w=0.707, x=0, y=0.707, z=0))
+    start_z_odom      = canvas_z + 0.30   # 30 cm above canvas surface
+    body_z_odom       = odom_T_flat_body.z
+    flat_body_T_hand  = SE3Pose(0.60, 0, start_z_odom - body_z_odom,
+                                Quat(w=0.707, x=0, y=0.707, z=0))
     odom_T_hand_start = odom_T_flat_body * flat_body_T_hand
     p                 = odom_T_hand_start.to_proto()
 
@@ -551,6 +558,100 @@ def draw_gcode(vicon_client, asc_client, cmd_client, state_client,
     odom_T_origin = build_canvas_origin(frame)
     c = frame.canvas
     canvas_z = float(np.mean([c.corners[i][2] for i in range(4)])) / 1000.0
+
+    _draw_gcode_impl(
+        asc_client, cmd_client, state_client,
+        gcode_path, scale, tool_length,
+        odom_T_origin, canvas_z,
+        canvas_width_mm=c.width_mm,
+        canvas_height_mm=c.height_mm,
+    )
+
+
+def draw_gcode_vicon(vicon_client, asc_client, cmd_client, state_client,
+                     gcode_path: str, tool_length: float,
+                     margin: float = 0.90) -> None:
+    """
+    Execute a gcode file bounded and centered within the Vicon canvas.
+
+    The 4-corner canvas geometry from Vicon defines the drawing space.
+    The gcode is auto-scaled (aspect-ratio-preserved) to fill *margin* fraction
+    of the canvas, then centered within it.  No explicit scale is needed.
+
+    Parameters
+    ----------
+    vicon_client    Active ViconClient with a valid canvas in latest_frame.
+    margin          Canvas fill fraction (0–1).  Default 0.90 leaves a 5% border.
+    """
+    print("  Reading canvas corners from Vicon…")
+    deadline = time.time() + 5.0
+    frame = None
+    while time.time() < deadline:
+        frame = vicon_client.latest_frame
+        if frame and frame.canvas and frame.canvas.is_valid():
+            break
+        time.sleep(0.1)
+    if frame is None or frame.canvas is None or not frame.canvas.is_valid():
+        raise RuntimeError("Canvas not visible in Vicon — cannot bound gcode.")
+
+    c = frame.canvas
+    canvas_z = float(np.mean([c.corners[i][2] for i in range(4)])) / 1000.0
+
+    # ── Auto-scale: fit gcode within canvas (margin applied) ─────────────
+    x_min, x_max, y_min, y_max = scan_gcode_bounds(gcode_path, scale=1.0)
+    gw = x_max - x_min
+    gh = y_max - y_min
+
+    if gw <= 0 or gh <= 0:
+        print("  [WARN] Could not determine gcode extents — using default scale 0.001")
+        scale = 0.001
+    else:
+        canvas_w_m = (c.width_mm / 1000.0) * margin
+        canvas_h_m = (c.height_mm / 1000.0) * margin
+        scale = min(canvas_w_m / gw, canvas_h_m / gh)
+
+        fitted_w_mm = gw * scale * 1000
+        fitted_h_mm = gh * scale * 1000
+        print(f"  Gcode extents   {gw:.2f} x {gh:.2f} raw units")
+        print(f"  Canvas          {c.width_mm:.0f} x {c.height_mm:.0f} mm"
+              f"  (margin {margin*100:.0f}%)")
+        print(f"  Auto-scale      {scale:.6f} m/unit"
+              f"  ->  drawing {fitted_w_mm:.0f} x {fitted_h_mm:.0f} mm on canvas")
+
+    # ── Center the drawing within the canvas ──────────────────────────────
+    # After scaling, the drawing spans (x_min*scale … x_max*scale) in gcode
+    # local coords.  We shift the origin so the drawing is centered on the canvas.
+    drawing_w_m = gw * scale
+    drawing_h_m = gh * scale
+    # How much blank space to leave on each side
+    pad_x = (c.width_mm  / 1000.0 - drawing_w_m) / 2.0   # along x_axis (TL→TR)
+    pad_y = (c.height_mm / 1000.0 - drawing_h_m) / 2.0   # along y_axis (TL→BL)
+
+    # gcode(0,0) maps to odom_T_origin.
+    # We want gcode(x_min*scale) to land at  TL + x_axis * pad_x,
+    # so gcode(0)  →  TL + x_axis * (pad_x − x_min*scale)
+    #                    + y_axis * (pad_y − y_min*scale)
+    tl_m  = c.corners[0] / 1000.0     # mm → m
+    x_ax  = c.x_axis                  # unit vector
+    y_ax  = c.y_axis                  # unit vector
+
+    origin_m = (tl_m
+                + x_ax * (pad_x - x_min * scale)
+                + y_ax * (pad_y - y_min * scale))
+
+    mat = np.column_stack([x_ax, y_ax, c.normal])
+    odom_T_origin = SE3Pose(
+        x=float(origin_m[0]),
+        y=float(origin_m[1]),
+        z=float(origin_m[2]),
+        rot=Quat.from_matrix(mat),
+    )
+
+    print(f"  Canvas TL       ({tl_m[0]*1000:+.0f}, {tl_m[1]*1000:+.0f},"
+          f" {tl_m[2]*1000:+.0f}) mm")
+    print(f"  Gcode origin    ({origin_m[0]*1000:+.0f}, {origin_m[1]*1000:+.0f},"
+          f" {origin_m[2]*1000:+.0f}) mm"
+          f"  (centering pads {pad_x*1000:.0f} × {pad_y*1000:.0f} mm)")
 
     _draw_gcode_impl(
         asc_client, cmd_client, state_client,
