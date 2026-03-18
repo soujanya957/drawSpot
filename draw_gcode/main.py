@@ -42,57 +42,63 @@ from bosdyn.api import geometry_pb2
 from bosdyn.client.arm_surface_contact import ArmSurfaceContactClient
 from bosdyn.client.estop import EstopClient, EstopEndpoint, EstopKeepAlive
 from bosdyn.client.frame_helpers import (
-    ODOM_FRAME_NAME, VISION_FRAME_NAME, WR1_FRAME_NAME,
-    GROUND_PLANE_FRAME_NAME, get_a_tform_b,
+    ODOM_FRAME_NAME,
+    VISION_FRAME_NAME,
+    WR1_FRAME_NAME,
+    GROUND_PLANE_FRAME_NAME,
+    get_a_tform_b,
 )
 from bosdyn.client.lease import LeaseClient, LeaseKeepAlive
 from bosdyn.client.math_helpers import Quat, SE3Pose
 from bosdyn.client.robot_command import (
-    RobotCommandBuilder, RobotCommandClient, blocking_stand,
+    RobotCommandBuilder,
+    RobotCommandClient,
+    blocking_stand,
 )
 from bosdyn.client.robot_state import RobotStateClient
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from config.robot_config import PASSWORD, ROBOT_IP, USERNAME, VICON_ADDRESS  # noqa: E402
-from vicon.client import ViconClient                                          # noqa: E402
+from vicon.client import ViconClient  # noqa: E402
 
-import draw_gcode._ctrl as _ctrl                                              # noqa: E402
-from draw_gcode.robot.navigator import walk_to_canvas, open_for_marker       # noqa: E402
+import draw_gcode._ctrl as _ctrl  # noqa: E402
+from draw_gcode.robot.navigator import walk_to_canvas, open_for_marker  # noqa: E402
 
 # Drawing primitives — same implementation as the proven gcode_manual approach
 from gcode_manual.gcode import GcodeReader, make_orthogonal, move_arm, get_transforms  # noqa: E402
 
-VICON_CONNECT_TO  = 6.0
+VICON_CONNECT_TO = 6.0
 G_CODES_DIR = os.path.join(os.path.dirname(__file__), "g_codes")
-_CFG_PATH   = os.path.join(os.path.dirname(__file__), "gcode.cfg")
+_CFG_PATH = os.path.join(os.path.dirname(__file__), "gcode.cfg")
 
-_ARM_REACH_IDEAL_MM = 600.0   # desired distance from body to canvas centre (mm)
-_ARM_REACH_TOL_MM   =  50.0   # acceptable error before walking is triggered (mm)
+_ARM_REACH_IDEAL_MM = 600.0  # desired distance from body to canvas centre (mm)
+_ARM_REACH_TOL_MM = 50.0  # acceptable error before walking is triggered (mm)
 
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
+
 def _load_cfg() -> dict:
     cfg = configparser.ConfigParser()
     cfg.read(_CFG_PATH)
-    g = cfg['General']
+    g = cfg["General"]
     return dict(
-        tool_length      = g.getfloat('tool_length', 0.0),
-        allow_walking    = g.getboolean('allow_walking', False),
-        velocity         = g.getfloat('velocity', 0.15),
-        press_force_pct  = g.getfloat('press_force_percent', -0.002),
-        below_z_adm      = g.getfloat('below_z_is_admittance', 0.0),
-        travel_z         = g.getfloat('travel_z', 0.05),
-        draw_z_offset    = g.getfloat('draw_z_offset', 0.005),
-        min_dist_to_goal = g.getfloat('min_dist_to_goal', 0.03),
-        gcode_start_x    = g.getfloat('gcode_start_x', 0),
-        gcode_start_y    = g.getfloat('gcode_start_y', 0),
-        draw_on_wall     = g.getboolean('draw_on_wall', False),
-        use_vision_frame = g.getboolean('use_vision_frame', True),
-        use_xy_cross     = g.getboolean('use_xy_to_z_cross_term', False),
-        bias_force_x     = g.getfloat('bias_force_x', 0.0),
+        tool_length=g.getfloat("tool_length", 0.0),
+        allow_walking=g.getboolean("allow_walking", False),
+        velocity=g.getfloat("velocity", 0.15),
+        press_force_pct=g.getfloat("press_force_percent", -0.002),
+        below_z_adm=g.getfloat("below_z_is_admittance", 0.0),
+        travel_z=g.getfloat("travel_z", 0.05),
+        draw_z_offset=g.getfloat("draw_z_offset", 0.005),
+        min_dist_to_goal=g.getfloat("min_dist_to_goal", 0.03),
+        gcode_start_x=g.getfloat("gcode_start_x", 0),
+        gcode_start_y=g.getfloat("gcode_start_y", 0),
+        draw_on_wall=g.getboolean("draw_on_wall", False),
+        use_vision_frame=g.getboolean("use_vision_frame", True),
+        use_xy_cross=g.getboolean("use_xy_to_z_cross_term", False),
+        bias_force_x=g.getfloat("bias_force_x", 0.0),
     )
 
 
@@ -100,12 +106,14 @@ def _load_cfg() -> dict:
 # Gcode selection  (uses input() — call with key listener stopped)
 # ---------------------------------------------------------------------------
 
+
 def select_gcode() -> str:
-    exts = ('.gcode', '.nc', '.ngc', '.tap')
+    exts = (".gcode", ".nc", ".ngc", ".tap")
     files = []
     if os.path.isdir(G_CODES_DIR):
         files = sorted(
-            os.path.join(G_CODES_DIR, n) for n in os.listdir(G_CODES_DIR)
+            os.path.join(G_CODES_DIR, n)
+            for n in os.listdir(G_CODES_DIR)
             if n.lower().endswith(exts)
         )
     if not files:
@@ -115,11 +123,11 @@ def select_gcode() -> str:
         )
 
     print(f"\nGcode files in {os.path.relpath(G_CODES_DIR)}/")
-    print('─' * 50)
+    print("─" * 50)
     for i, f in enumerate(files, 1):
         kb = os.path.getsize(f) / 1024
         print(f"  [{i}]  {os.path.basename(f)}  ({kb:.1f} KB)")
-    print('─' * 50)
+    print("─" * 50)
 
     while True:
         raw = input(f"Select [1–{len(files)}]: ").strip()
@@ -144,24 +152,29 @@ def select_gcode() -> str:
 # Auto-scale: fit gcode within canvas
 # ---------------------------------------------------------------------------
 
+
 def _scan_bounds(gcode_path: str):
     """Return (x_min, x_max, y_min, y_max) at scale=1.0."""
     x_vals, y_vals = [], []
     with open(gcode_path) as fh:
         for line in fh:
-            for ch in ('(', ';', '%'):
+            for ch in ("(", ";", "%"):
                 if ch in line:
-                    line = line[:line.find(ch)]
+                    line = line[: line.find(ch)]
             parts = line.split()
-            if not parts or parts[0] not in ('G0', 'G00', 'G1', 'G01'):
+            if not parts or parts[0] not in ("G0", "G00", "G1", "G01"):
                 continue
             for p in parts[1:]:
-                if p.startswith('X'):
-                    try: x_vals.append(float(p[1:]))
-                    except ValueError: pass
-                elif p.startswith('Y'):
-                    try: y_vals.append(float(p[1:]))
-                    except ValueError: pass
+                if p.startswith("X"):
+                    try:
+                        x_vals.append(float(p[1:]))
+                    except ValueError:
+                        pass
+                elif p.startswith("Y"):
+                    try:
+                        y_vals.append(float(p[1:]))
+                    except ValueError:
+                        pass
     if not x_vals or not y_vals:
         return 0.0, 1.0, 0.0, 1.0
     return min(x_vals), max(x_vals), min(y_vals), max(y_vals)
@@ -175,32 +188,42 @@ def compute_scale(gcode_path: str, canvas, margin: float = 0.90) -> float:
     if gw <= 0 or gh <= 0:
         print("  [WARN] Cannot determine gcode extents — using 0.001 m/unit")
         return 0.001
-    cw    = (canvas.width_mm  / 1000.0) * margin
-    ch    = (canvas.height_mm / 1000.0) * margin
+    cw = (canvas.width_mm / 1000.0) * margin
+    ch = (canvas.height_mm / 1000.0) * margin
     scale = min(cw / gw, ch / gh)
-    cx    = (x_min + x_max) / 2.0
-    cy    = (y_min + y_max) / 2.0
-    print(f"  Gcode extents  {gw:.1f} × {gh:.1f} raw units  (center {cx:.1f}, {cy:.1f})")
-    print(f"  Canvas         {canvas.width_mm:.0f} × {canvas.height_mm:.0f} mm"
-          f"  (margin {margin*100:.0f}%)")
-    print(f"  Auto-scale     {scale:.6f} m/unit"
-          f"  →  drawing {gw*scale*1000:.0f} × {gh*scale*1000:.0f} mm  (centered)")
+    cx = (x_min + x_max) / 2.0
+    cy = (y_min + y_max) / 2.0
+    print(
+        f"  Gcode extents  {gw:.1f} × {gh:.1f} raw units  (center {cx:.1f}, {cy:.1f})"
+    )
+    print(
+        f"  Canvas         {canvas.width_mm:.0f} × {canvas.height_mm:.0f} mm"
+        f"  (margin {margin * 100:.0f}%)"
+    )
+    print(
+        f"  Auto-scale     {scale:.6f} m/unit"
+        f"  →  drawing {gw * scale * 1000:.0f} × {gh * scale * 1000:.0f} mm  (centered)"
+    )
     return scale
 
 
 def _rotation_matrix(q) -> np.ndarray:
     """Build 3×3 rotation matrix from (qx, qy, qz, qw)."""
     qx, qy, qz, qw = q
-    return np.array([
-        [1 - 2*(qy**2 + qz**2),   2*(qx*qy - qz*qw),   2*(qx*qz + qy*qw)],
-        [  2*(qx*qy + qz*qw), 1 - 2*(qx**2 + qz**2),   2*(qy*qz - qx*qw)],
-        [  2*(qx*qz - qy*qw),   2*(qy*qz + qx*qw), 1 - 2*(qx**2 + qy**2)],
-    ], dtype=float)
+    return np.array(
+        [
+            [1 - 2 * (qy**2 + qz**2), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+            [2 * (qx * qy + qz * qw), 1 - 2 * (qx**2 + qz**2), 2 * (qy * qz - qx * qw)],
+            [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx**2 + qy**2)],
+        ],
+        dtype=float,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Pre-draw body positioning: walk until canvas centre is at ideal arm distance
 # ---------------------------------------------------------------------------
+
 
 def _walk_arm_to_canvas_center(vicon_client, cmd_client) -> bool:
     """
@@ -209,51 +232,62 @@ def _walk_arm_to_canvas_center(vicon_client, cmd_client) -> bool:
     Once within tolerance the base is stopped and drawing proceeds locked.
     Returns False only if estop fires.
     """
-    _SPEED   = 0.20   # m/s — slow and controlled
-    _CMD_DUR = 0.4    # s per velocity burst
+    _SPEED = 0.20  # m/s — slow and controlled
+    _CMD_DUR = 0.4  # s per velocity burst
 
     print("  Positioning body so arm reaches canvas centre…", flush=True)
 
-    for _ in range(120):   # max ~12 s
+    for _ in range(120):  # max ~12 s
         if not _ctrl.check():
             return False
 
         frame = vicon_client.latest_frame
-        if (frame is None or frame.canvas is None or not frame.canvas.is_valid()
-                or frame.spot_body is None or frame.spot_body.occluded):
+        if (
+            frame is None
+            or frame.canvas is None
+            or not frame.canvas.is_valid()
+            or frame.spot_body is None
+            or frame.spot_body.occluded
+        ):
             time.sleep(0.1)
             continue
 
-        center_mm  = np.mean(np.array(frame.canvas.corners), axis=0)
-        robot_mm   = np.array(frame.spot_body.position)
-        delta_mm   = center_mm - robot_mm
-        R          = _rotation_matrix(frame.spot_body.rotation_quat)   # world←body
-        delta_body = R.T @ delta_mm                                     # body frame mm
+        center_mm = np.mean(np.array(frame.canvas.corners), axis=0)
+        robot_mm = np.array(frame.spot_body.position)
+        delta_mm = center_mm - robot_mm
+        R = _rotation_matrix(frame.spot_body.rotation_quat)  # world←body
+        delta_body = R.T @ delta_mm  # body frame mm
 
-        fwd_err = float(delta_body[0]) - _ARM_REACH_IDEAL_MM   # +ve → too far, step fwd
-        lat_err = float(delta_body[1])                          # +ve → centre is left
+        fwd_err = float(delta_body[0]) - _ARM_REACH_IDEAL_MM  # +ve → too far, step fwd
+        lat_err = float(delta_body[1])  # +ve → centre is left
 
         if abs(fwd_err) < _ARM_REACH_TOL_MM and abs(lat_err) < _ARM_REACH_TOL_MM / 2:
             cmd_client.robot_command(
                 RobotCommandBuilder.synchro_velocity_command(0, 0, 0),
-                end_time_secs=time.time() + 0.3)
-            print(f"  Body locked: canvas centre at "
-                  f"({float(delta_body[0]):.0f}, {float(delta_body[1]):.0f}) mm body",
-                  flush=True)
+                end_time_secs=time.time() + 0.3,
+            )
+            print(
+                f"  Body locked: canvas centre at "
+                f"({float(delta_body[0]):.0f}, {float(delta_body[1]):.0f}) mm body",
+                flush=True,
+            )
             return True
 
         # Normalise and scale velocity in body frame (v_x=fwd, v_y=left)
-        mag  = _math.sqrt(fwd_err**2 + lat_err**2)
-        v_x  = float(np.clip(fwd_err / mag * _SPEED, -_SPEED, _SPEED))
-        v_y  = float(np.clip(lat_err / mag * _SPEED, -_SPEED, _SPEED))
+        mag = _math.sqrt(fwd_err**2 + lat_err**2)
+        v_x = float(np.clip(fwd_err / mag * _SPEED, -_SPEED, _SPEED))
+        v_y = float(np.clip(lat_err / mag * _SPEED, -_SPEED, _SPEED))
 
         cmd_client.robot_command(
             RobotCommandBuilder.synchro_velocity_command(v_x, v_y, 0),
-            end_time_secs=time.time() + _CMD_DUR)
+            end_time_secs=time.time() + _CMD_DUR,
+        )
         time.sleep(0.1)
 
-    print("  [WARN] Body positioning timed out — drawing from current position",
-          flush=True)
+    print(
+        "  [WARN] Body positioning timed out — drawing from current position",
+        flush=True,
+    )
     return _ctrl.check()
 
 
@@ -264,23 +298,30 @@ def _walk_arm_to_canvas_center(vicon_client, cmd_client) -> bool:
 # Returns True on success, False if estop fired.
 # ---------------------------------------------------------------------------
 
-def _draw_file(gcode_file: str, scale: float, vicon_client,
-               state_client, cmd_client, asc_client,
-               robot_logger, cfg: dict) -> bool:
 
-    tool_length      = cfg['tool_length']
-    allow_walking    = cfg['allow_walking']
-    velocity         = cfg['velocity']
-    press_force_pct  = cfg['press_force_pct']
-    below_z_adm      = cfg['below_z_adm']
-    travel_z         = cfg['travel_z']
-    draw_z_offset    = cfg['draw_z_offset']
-    min_dist_to_goal = cfg['min_dist_to_goal']
-    draw_on_wall     = cfg['draw_on_wall']
-    use_vision_frame = cfg['use_vision_frame']
-    use_xy_cross     = cfg['use_xy_cross']
-    bias_force_x     = cfg['bias_force_x']
-    api_send_frame   = VISION_FRAME_NAME if use_vision_frame else ODOM_FRAME_NAME
+def _draw_file(
+    gcode_file: str,
+    scale: float,
+    vicon_client,
+    state_client,
+    cmd_client,
+    asc_client,
+    robot_logger,
+    cfg: dict,
+) -> bool:
+    tool_length = cfg["tool_length"]
+    allow_walking = cfg["allow_walking"]
+    velocity = cfg["velocity"]
+    press_force_pct = cfg["press_force_pct"]
+    below_z_adm = cfg["below_z_adm"]
+    travel_z = cfg["travel_z"]
+    draw_z_offset = cfg["draw_z_offset"]
+    min_dist_to_goal = cfg["min_dist_to_goal"]
+    draw_on_wall = cfg["draw_on_wall"]
+    use_vision_frame = cfg["use_vision_frame"]
+    use_xy_cross = cfg["use_xy_cross"]
+    bias_force_x = cfg["bias_force_x"]
+    api_send_frame = VISION_FRAME_NAME if use_vision_frame else ODOM_FRAME_NAME
 
     # Proto identity transform used by ArmSurfaceContact
     vision_T_admittance = geometry_pb2.SE3Pose(
@@ -296,68 +337,119 @@ def _draw_file(gcode_file: str, scale: float, vicon_client,
     x_min, x_max, y_min, y_max = _scan_bounds(gcode_file)
     gcode_start_x = (x_min + x_max) / 2.0
     gcode_start_y = (y_min + y_max) / 2.0
-    robot_logger.info('Gcode center offset: (%.1f, %.1f)', gcode_start_x, gcode_start_y)
+    robot_logger.info("Gcode center offset: (%.1f, %.1f)", gcode_start_x, gcode_start_y)
 
-    gcode = GcodeReader(gcode_file, tool_length, scale, robot_logger,
-                        below_z_adm, travel_z, draw_on_wall,
-                        gcode_start_x, gcode_start_y, draw_z_offset)
+    gcode = GcodeReader(
+        gcode_file,
+        tool_length,
+        scale,
+        robot_logger,
+        below_z_adm,
+        travel_z,
+        draw_on_wall,
+        gcode_start_x,
+        gcode_start_y,
+        draw_z_offset,
+    )
 
     # ── Walk body so canvas centre is at ideal arm distance, then lock base ─
     if not _walk_arm_to_canvas_center(vicon_client, cmd_client):
         return False
 
-    # ── Move arm directly above canvas centre (arm_y=0: walk already corrects lateral) ──
+    # ── Move arm directly above canvas centre ────────────────────────────────
+    # Read the actual canvas centre from Vicon so the arm targets the correct
+    # XY even when the body walk stopped slightly short/long of the ideal
+    # distance (walk tolerance is ±50 mm — enough to miss the canvas entirely
+    # if we use a hardcoded forward reach).
     robot_state = state_client.get_robot_state()
-    flat_body_T_hand = SE3Pose(_ARM_REACH_IDEAL_MM / 1000.0, 0.0, -0.45,
-                                Quat(w=0.707, x=0, y=0.707, z=0))
+    reach_m   = _ARM_REACH_IDEAL_MM / 1000.0   # safe fallback
+    lateral_m = 0.0
+    _vf = vicon_client.latest_frame
+    if (_vf and _vf.canvas and _vf.canvas.is_valid()
+            and _vf.spot_body and not _vf.spot_body.occluded):
+        _ctr   = np.mean(np.array(_vf.canvas.corners), axis=0)
+        _delta = _ctr - np.array(_vf.spot_body.position)
+        _R     = _rotation_matrix(_vf.spot_body.rotation_quat)   # world ← body
+        _db    = _R.T @ _delta                                    # delta in body frame (mm)
+        reach_m   = float(np.clip(_db[0] / 1000.0, 0.40, 0.75))
+        lateral_m = float(np.clip(_db[1] / 1000.0, -0.30, 0.30))
+        robot_logger.info(
+            "Canvas centre in body frame: fwd=%.0f mm  lat=%.0f mm  (arm target)",
+            _db[0], _db[1])
+    else:
+        robot_logger.warning(
+            "Vicon canvas/body not visible — falling back to hardcoded %.0f mm forward",
+            _ARM_REACH_IDEAL_MM)
+    flat_body_T_hand = SE3Pose(reach_m, lateral_m, -0.45, Quat(w=0.707, x=0, y=0.707, z=0))
     (_, odom_T_flat_body, _, _, _, _) = get_transforms(False, robot_state)
     odom_T_hand = odom_T_flat_body * flat_body_T_hand
     p = odom_T_hand.to_proto()
 
-    robot_logger.info('Moving arm to canvas centre…')
+    robot_logger.info("Moving arm to canvas centre…")
     arm_cmd = RobotCommandBuilder.arm_pose_command(
-        p.position.x, p.position.y, p.position.z,
-        p.rotation.w, p.rotation.x, p.rotation.y, p.rotation.z,
-        ODOM_FRAME_NAME, 0.000001,
+        p.position.x,
+        p.position.y,
+        p.position.z,
+        p.rotation.w,
+        p.rotation.x,
+        p.rotation.y,
+        p.rotation.z,
+        ODOM_FRAME_NAME,
+        0.000001,
     )
     cmd_client.robot_command(RobotCommandBuilder.build_synchro_command(arm_cmd))
-    if not _ctrl.sleep(3.0):   # waits up to 3 s, checking estop every 50 ms
+    if not _ctrl.sleep(3.0):  # waits up to 3 s, checking estop every 50 ms
         return False
 
     # ── Confirm before touching down ──────────────────────────────────────
     if not _ctrl.wait_confirm(
-            f"File: {os.path.basename(gcode_file)}\n"
-            "  Arm is in position. Press ENTER to touch down and begin drawing."):
+        f"File: {os.path.basename(gcode_file)}\n"
+        "  Arm is in position. Press ENTER to touch down and begin drawing."
+    ):
         return False
 
     # ── Touch-to-find-ground ──────────────────────────────────────────────
     robot_state = state_client.get_robot_state()
     snap = robot_state.kinematic_state.transforms_snapshot
 
-    vision_T_wr1  = get_a_tform_b(snap, VISION_FRAME_NAME, WR1_FRAME_NAME)
+    vision_T_wr1 = get_a_tform_b(snap, VISION_FRAME_NAME, WR1_FRAME_NAME)
     vision_T_tool = vision_T_wr1 * wr1_T_tool
 
-    robot_logger.info('Pressing marker down to find surface…')
-    move_arm(robot_state, True, [vision_T_tool], asc_client, cmd_client, 0.04,
-             allow_walking, vision_T_admittance, press_force_pct,
-             api_send_frame, use_xy_cross, bias_force_x)
-    if not _ctrl.sleep(8.0):   # wait for surface contact; checks estop every 50 ms
+    robot_logger.info("Pressing marker down to find surface…")
+    move_arm(
+        robot_state,
+        True,
+        [vision_T_tool],
+        asc_client,
+        cmd_client,
+        0.04,
+        allow_walking,
+        vision_T_admittance,
+        press_force_pct,
+        api_send_frame,
+        use_xy_cross,
+        bias_force_x,
+    )
+    if not _ctrl.sleep(8.0):  # wait for surface contact; checks estop every 50 ms
         return False
 
     # ── Re-read state after touchdown ─────────────────────────────────────
     robot_state = state_client.get_robot_state()
-    (vision_T_body, _, body_T_hand, _, _, odom_T_body) = get_transforms(True, robot_state)
+    (vision_T_body, _, body_T_hand, _, _, odom_T_body) = get_transforms(
+        True, robot_state
+    )
     snap = robot_state.kinematic_state.transforms_snapshot
 
     odom_T_ground = get_a_tform_b(snap, ODOM_FRAME_NAME, GROUND_PLANE_FRAME_NAME)
     vision_T_odom = vision_T_body * odom_T_body.inverse()
     gx, gy, gz = vision_T_odom.transform_point(
-        odom_T_ground.x, odom_T_ground.y, odom_T_ground.z)
+        odom_T_ground.x, odom_T_ground.y, odom_T_ground.z
+    )
     ground_plane_rt_vision = [gx, gy, gz]
 
-    vision_T_wr1  = get_a_tform_b(snap, VISION_FRAME_NAME, WR1_FRAME_NAME, validate=True)
+    vision_T_wr1 = get_a_tform_b(snap, VISION_FRAME_NAME, WR1_FRAME_NAME, validate=True)
     vision_T_tool = vision_T_wr1 * wr1_T_tool
-    ground_plane_rt_vision[2] = vision_T_tool.z   # pin Z to actual touch point
+    ground_plane_rt_vision[2] = vision_T_tool.z  # pin Z to actual touch point
 
     # ── Set gcode origin at the ACTUAL TOUCH POINT ────────────────────────
     #
@@ -375,115 +467,171 @@ def _draw_file(gcode_file: str, scale: float, vicon_client,
     # gcode(0,0)= canvas centre (gcode_start_x/y = bounding-box centre above)
     zhat = np.array([0.0, 0.0, 1.0])
     bfwd = list(vision_T_body.rot.transform_point(1.0, 0.0, 0.0))
-    xhat = make_orthogonal(zhat, bfwd)    # body forward projected to horizontal
-    yhat = np.cross(zhat, xhat)            # body left, horizontal
+    xhat = make_orthogonal(zhat, bfwd)  # body forward projected to horizontal
+    yhat = np.cross(zhat, xhat)  # body left, horizontal
     rot_mat = np.column_stack([xhat, yhat, zhat])
 
-    gcode.vision_T_origin = SE3Pose(vision_T_tool.x, vision_T_tool.y, vision_T_tool.z,
-                                     Quat.from_matrix(rot_mat))
-    robot_logger.info('Origin at touch point (%.3f, %.3f, %.3f)  body-fwd=(%.3f,%.3f)',
-                      vision_T_tool.x, vision_T_tool.y, vision_T_tool.z,
-                      xhat[0], xhat[1])
+    gcode.vision_T_origin = SE3Pose(
+        vision_T_tool.x, vision_T_tool.y, vision_T_tool.z, Quat.from_matrix(rot_mat)
+    )
+    robot_logger.info(
+        "Origin at touch point (%.3f, %.3f, %.3f)  body-fwd=(%.3f,%.3f)",
+        vision_T_tool.x,
+        vision_T_tool.y,
+        vision_T_tool.z,
+        xhat[0],
+        xhat[1],
+    )
 
     # ── Lift arm to travel height before starting gcode loop ──────────────
     touch_z = vision_T_tool.z
     tp = vision_T_tool.to_proto()
     lift_cmd = RobotCommandBuilder.arm_pose_command(
-        tp.position.x, tp.position.y, touch_z + travel_z,
-        tp.rotation.w, tp.rotation.x, tp.rotation.y, tp.rotation.z,
-        VISION_FRAME_NAME, 2.0)
+        tp.position.x,
+        tp.position.y,
+        touch_z + travel_z,
+        tp.rotation.w,
+        tp.rotation.x,
+        tp.rotation.y,
+        tp.rotation.z,
+        VISION_FRAME_NAME,
+        2.0,
+    )
     cmd_client.robot_command(RobotCommandBuilder.build_synchro_command(lift_cmd))
     if not _ctrl.sleep(2.5):
         return False
 
     # ── Execute gcode loop ────────────────────────────────────────────────
-    (is_admittance, vision_T_goals, is_pause) = \
-        gcode.get_next_vision_T_goals(ground_plane_rt_vision)
+    (is_admittance, vision_T_goals, is_pause) = gcode.get_next_vision_T_goals(
+        ground_plane_rt_vision
+    )
 
     while is_pause:
         if not _ctrl.wait_confirm("M0 pause — press ENTER to continue."):
             return False
-        (is_admittance, vision_T_goals, is_pause) = \
-            gcode.get_next_vision_T_goals(ground_plane_rt_vision)
+        (is_admittance, vision_T_goals, is_pause) = gcode.get_next_vision_T_goals(
+            ground_plane_rt_vision
+        )
 
     if vision_T_goals is None:
-        robot_logger.info('Gcode file is empty.')
+        robot_logger.info("Gcode file is empty.")
         return True
 
     if not _ctrl.check():
         return False
 
-    move_arm(robot_state, is_admittance, vision_T_goals, asc_client, cmd_client, velocity,
-             allow_walking, vision_T_admittance, press_force_pct,
-             api_send_frame, use_xy_cross, bias_force_x)
+    move_arm(
+        robot_state,
+        is_admittance,
+        vision_T_goals,
+        asc_client,
+        cmd_client,
+        velocity,
+        allow_walking,
+        vision_T_admittance,
+        press_force_pct,
+        api_send_frame,
+        use_xy_cross,
+        bias_force_x,
+    )
     odom_T_hand_goal = vision_T_odom.inverse() * vision_T_goals[-1]
-    last_admittance  = is_admittance
+    last_admittance = is_admittance
 
     while True:
         if not _ctrl.check():
             return False
 
         robot_state = state_client.get_robot_state()
-        (vision_T_body, _, body_T_hand, _, _, odom_T_body) = get_transforms(True, robot_state)
+        (vision_T_body, _, body_T_hand, _, _, odom_T_body) = get_transforms(
+            True, robot_state
+        )
         vision_T_odom = vision_T_body * odom_T_body.inverse()
         ground_plane_rt_vision[0], ground_plane_rt_vision[1] = (
             vision_T_odom.transform_point(
-                odom_T_ground.x, odom_T_ground.y, odom_T_ground.z)[:2]
+                odom_T_ground.x, odom_T_ground.y, odom_T_ground.z
+            )[:2]
         )
 
-        adm_inv     = SE3Pose.from_proto(vision_T_admittance).inverse()
+        adm_inv = SE3Pose.from_proto(vision_T_admittance).inverse()
         hand_in_adm = adm_inv * vision_T_odom * odom_T_body * body_T_hand
         goal_in_adm = adm_inv * vision_T_odom * odom_T_hand_goal
 
         if is_admittance:
-            dist = _math.sqrt((hand_in_adm.x - goal_in_adm.x)**2 +
-                              (hand_in_adm.y - goal_in_adm.y)**2)
+            dist = _math.sqrt(
+                (hand_in_adm.x - goal_in_adm.x) ** 2
+                + (hand_in_adm.y - goal_in_adm.y) ** 2
+            )
         else:
-            dist = _math.sqrt((hand_in_adm.x - goal_in_adm.x)**2 +
-                              (hand_in_adm.y - goal_in_adm.y)**2 +
-                              (hand_in_adm.z - goal_in_adm.z)**2)
+            dist = _math.sqrt(
+                (hand_in_adm.x - goal_in_adm.x) ** 2
+                + (hand_in_adm.y - goal_in_adm.y) ** 2
+                + (hand_in_adm.z - goal_in_adm.z) ** 2
+            )
 
         if dist < min_dist_to_goal:
-            (is_admittance, vision_T_goals, is_pause) = \
-                gcode.get_next_vision_T_goals(ground_plane_rt_vision)
+            (is_admittance, vision_T_goals, is_pause) = gcode.get_next_vision_T_goals(
+                ground_plane_rt_vision
+            )
 
             while is_pause:
                 if not _ctrl.wait_confirm("M0 pause — press ENTER to continue."):
                     return False
-                (is_admittance, vision_T_goals, is_pause) = \
+                (is_admittance, vision_T_goals, is_pause) = (
                     gcode.get_next_vision_T_goals(ground_plane_rt_vision)
+                )
 
             if vision_T_goals is None:
-                robot_logger.info('Gcode program finished.')
+                robot_logger.info("Gcode program finished.")
                 # 1. Lift off paper so the marker doesn't drag during stow.
                 robot_state = state_client.get_robot_state()
-                vt_wr1  = get_a_tform_b(
+                vt_wr1 = get_a_tform_b(
                     robot_state.kinematic_state.transforms_snapshot,
-                    VISION_FRAME_NAME, WR1_FRAME_NAME)
+                    VISION_FRAME_NAME,
+                    WR1_FRAME_NAME,
+                )
                 vt_tool = vt_wr1 * wr1_T_tool
                 ep = vt_tool.to_proto()
                 lift = RobotCommandBuilder.arm_pose_command(
-                    ep.position.x, ep.position.y, touch_z + travel_z,
-                    ep.rotation.w, ep.rotation.x, ep.rotation.y, ep.rotation.z,
-                    VISION_FRAME_NAME, 2.0)
+                    ep.position.x,
+                    ep.position.y,
+                    touch_z + travel_z,
+                    ep.rotation.w,
+                    ep.rotation.x,
+                    ep.rotation.y,
+                    ep.rotation.z,
+                    VISION_FRAME_NAME,
+                    2.0,
+                )
                 cmd_client.robot_command(
-                    RobotCommandBuilder.build_synchro_command(lift))
+                    RobotCommandBuilder.build_synchro_command(lift)
+                )
                 _ctrl.sleep(2.0)
                 # 2. Stow arm fully before returning — callers must not need to stow.
-                robot_logger.info('Stowing arm…')
+                robot_logger.info("Stowing arm…")
                 try:
                     cmd_client.robot_command(RobotCommandBuilder.arm_stow_command())
                 except Exception:
                     pass
-                _ctrl.sleep(4.0)   # stow from extended position takes ~3-4 s
+                _ctrl.sleep(4.0)  # stow from extended position takes ~3-4 s
                 return True
 
             if not _ctrl.check():
                 return False
 
-            move_arm(robot_state, is_admittance, vision_T_goals, asc_client, cmd_client,
-                     velocity, allow_walking, vision_T_admittance, press_force_pct,
-                     api_send_frame, use_xy_cross, bias_force_x)
+            move_arm(
+                robot_state,
+                is_admittance,
+                vision_T_goals,
+                asc_client,
+                cmd_client,
+                velocity,
+                allow_walking,
+                vision_T_admittance,
+                press_force_pct,
+                api_send_frame,
+                use_xy_cross,
+                bias_force_x,
+            )
             odom_T_hand_goal = vision_T_odom.inverse() * vision_T_goals[-1]
 
             if is_admittance != last_admittance:
@@ -491,8 +639,9 @@ def _draw_file(gcode_file: str, scale: float, vicon_client,
             last_admittance = is_admittance
 
         elif not is_admittance:
-            (is_admittance, vision_T_goals, is_pause) = \
-                gcode.get_next_vision_T_goals(ground_plane_rt_vision, read_new_line=False)
+            (is_admittance, vision_T_goals, is_pause) = gcode.get_next_vision_T_goals(
+                ground_plane_rt_vision, read_new_line=False
+            )
 
         time.sleep(0.05)
 
@@ -501,11 +650,12 @@ def _draw_file(gcode_file: str, scale: float, vicon_client,
 # Emergency-stop cleanup helper
 # ---------------------------------------------------------------------------
 
+
 def _do_estop_cleanup(cmd_client) -> None:
     print("\n[ESTOP] Stowing arm and sitting…")
     try:
         cmd_client.robot_command(RobotCommandBuilder.arm_stow_command())
-        time.sleep(4)   # stow from extended position takes ~3-4 s
+        time.sleep(4)  # stow from extended position takes ~3-4 s
         cmd_client.robot_command(RobotCommandBuilder.synchro_sit_command())
         time.sleep(2)
     except Exception:
@@ -516,10 +666,11 @@ def _do_estop_cleanup(cmd_client) -> None:
 # Main pipeline
 # ---------------------------------------------------------------------------
 
+
 def run(vicon_client, robot) -> None:
-    cmd_client   = robot.ensure_client(RobotCommandClient.default_service_name)
+    cmd_client = robot.ensure_client(RobotCommandClient.default_service_name)
     state_client = robot.ensure_client(RobotStateClient.default_service_name)
-    asc_client   = robot.ensure_client(ArmSurfaceContactClient.default_service_name)
+    asc_client = robot.ensure_client(ArmSurfaceContactClient.default_service_name)
     lease_client = robot.ensure_client(LeaseClient.default_service_name)
     estop_client = robot.ensure_client(EstopClient.default_service_name)
 
@@ -528,9 +679,10 @@ def run(vicon_client, robot) -> None:
 
     cfg = _load_cfg()
 
-    with EstopKeepAlive(estop_ep), \
-         LeaseKeepAlive(lease_client, must_acquire=True, return_at_exit=True):
-
+    with (
+        EstopKeepAlive(estop_ep),
+        LeaseKeepAlive(lease_client, must_acquire=True, return_at_exit=True),
+    ):
         # ── Stand up ──────────────────────────────────────────────────────
         print("Standing up…")
         robot.power_on(timeout_sec=20)
@@ -580,9 +732,16 @@ def run(vicon_client, robot) -> None:
 
             # ── Draw ────────────────────────────────────────────────────
             print(f"\n─── Drawing: {os.path.basename(gcode_path)}")
-            ok = _draw_file(gcode_path, scale, vicon_client,
-                            state_client, cmd_client, asc_client,
-                            robot.logger, cfg)
+            ok = _draw_file(
+                gcode_path,
+                scale,
+                vicon_client,
+                state_client,
+                cmd_client,
+                asc_client,
+                robot.logger,
+                cfg,
+            )
 
             # ── Stow arm after drawing ───────────────────────────────────
             # _draw_file already stows on success; this is a safety fallback
@@ -590,7 +749,7 @@ def run(vicon_client, robot) -> None:
             print("\n  Stowing arm…")
             try:
                 cmd_client.robot_command(RobotCommandBuilder.arm_stow_command())
-                time.sleep(4)   # stow from extended position takes ~3-4 s
+                time.sleep(4)  # stow from extended position takes ~3-4 s
             except Exception:
                 pass
             blocking_stand(cmd_client, timeout_sec=10)
@@ -606,13 +765,13 @@ def run(vicon_client, robot) -> None:
             print("│  Draw another file?  [y/N]              │")
             print("└─────────────────────────────────────────┘")
             ans = input("> ").strip().lower()
-            if ans != 'y':
+            if ans != "y":
                 _ctrl.start_key_listener()
                 break
 
             print()
             print("  Change marker?  [y/N]")
-            change_marker = input("> ").strip().lower() == 'y'
+            change_marker = input("> ").strip().lower() == "y"
             _ctrl.start_key_listener()
 
             if change_marker:
@@ -638,14 +797,19 @@ def run(vicon_client, robot) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
     import argparse
+
     ap = argparse.ArgumentParser(
         description="draw_gcode — autonomous walk + marker grab + gcode drawing",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    ap.add_argument("--vicon", metavar="HOST:PORT",
-                    help=f"Vicon address (default from .env: {VICON_ADDRESS})")
+    ap.add_argument(
+        "--vicon",
+        metavar="HOST:PORT",
+        help=f"Vicon address (default from .env: {VICON_ADDRESS})",
+    )
     args = ap.parse_args()
 
     vicon_addr = args.vicon or VICON_ADDRESS
@@ -664,17 +828,21 @@ def main() -> None:
     frame = vicon.latest_frame
     if frame.canvas is None or not frame.canvas.is_valid():
         vicon.stop()
-        raise SystemExit("Canvas not visible — check test_canvas markers in Vicon Tracker.")
+        raise SystemExit(
+            "Canvas not visible — check test_canvas markers in Vicon Tracker."
+        )
 
     spot_ok = frame.spot_body is not None and not frame.spot_body.occluded
-    print(f"Vicon OK  |  canvas {frame.canvas.width_mm:.0f} × {frame.canvas.height_mm:.0f} mm"
-          f"  |  spot_base: {'OK' if spot_ok else 'NO DATA'}\n")
+    print(
+        f"Vicon OK  |  canvas {frame.canvas.width_mm:.0f} × {frame.canvas.height_mm:.0f} mm"
+        f"  |  spot_base: {'OK' if spot_ok else 'NO DATA'}\n"
+    )
     if not spot_ok:
         print("[WARN] spot_base not visible — navigation will wait for it.\n")
 
     print("Connecting to Spot…")
     bosdyn.client.util.setup_logging(verbose=False)
-    sdk   = bosdyn.client.create_standard_sdk("DrawGcode")
+    sdk = bosdyn.client.create_standard_sdk("DrawGcode")
     robot = sdk.create_robot(ROBOT_IP)
     robot.authenticate(USERNAME, PASSWORD)
     robot.time_sync.wait_for_sync()
