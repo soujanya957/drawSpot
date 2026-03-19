@@ -54,6 +54,7 @@ from bosdyn.client.robot_command import (
     RobotCommandBuilder,
     RobotCommandClient,
     blocking_stand,
+    block_until_arm_arrives,
 )
 from bosdyn.client.robot_state import RobotStateClient
 
@@ -356,49 +357,57 @@ def _draw_file(
     if not _walk_arm_to_canvas_center(vicon_client, cmd_client):
         return False
 
-    # ── Move arm directly above canvas centre ────────────────────────────────
-    # Read the actual canvas centre from Vicon so the arm targets the correct
-    # XY even when the body walk stopped slightly short/long of the ideal
-    # distance (walk tolerance is ±50 mm — enough to miss the canvas entirely
-    # if we use a hardcoded forward reach).
+    # ── Move arm above canvas centre ─────────────────────────────────────────
+    # Find the canvas centre in the SDK vision frame by rotating the
+    # Vicon-measured body→canvas delta through the SDK body orientation.
+    # This correctly bridges the two coordinate systems without assuming their
+    # world-frame origins are aligned.
+    #
+    # Z: -0.25 m below flat_body keeps the marker tip ~5 cm above the floor
+    # so touch-to-find-ground can press down to the surface (not already on it).
     robot_state = state_client.get_robot_state()
-    reach_m   = _ARM_REACH_IDEAL_MM / 1000.0   # safe fallback
-    lateral_m = 0.0
+    (vision_T_body, vision_T_flat_body, _, _, _, _) = get_transforms(True, robot_state)
+    hand_quat = Quat(w=0.707, x=0, y=0.707, z=0)
+    arm_z = vision_T_flat_body.z - 0.25   # hover height in vision frame
+
+    # Default XY: ideal reach forward, no lateral offset
+    _dflt_x, _dflt_y, _ = vision_T_flat_body.rot.transform_point(
+        _ARM_REACH_IDEAL_MM / 1000.0, 0.0, 0.0)
+    arm_x = vision_T_flat_body.x + _dflt_x
+    arm_y = vision_T_flat_body.y + _dflt_y
+
     _vf = vicon_client.latest_frame
     if (_vf and _vf.canvas and _vf.canvas.is_valid()
             and _vf.spot_body and not _vf.spot_body.occluded):
-        _ctr   = np.mean(np.array(_vf.canvas.corners), axis=0)
-        _delta = _ctr - np.array(_vf.spot_body.position)
-        _R     = _rotation_matrix(_vf.spot_body.rotation_quat)   # world ← body
-        _db    = _R.T @ _delta                                    # delta in body frame (mm)
-        reach_m   = float(np.clip(_db[0] / 1000.0, 0.40, 0.75))
-        lateral_m = float(np.clip(_db[1] / 1000.0, -0.30, 0.30))
+        # body→canvas delta in Vicon world frame, rotated to body frame
+        _ctr  = np.mean(np.array(_vf.canvas.corners), axis=0)
+        _delt = _ctr - np.array(_vf.spot_body.position)              # mm, Vicon world
+        _Rv   = _rotation_matrix(_vf.spot_body.rotation_quat)        # Vicon world ← body
+        _db   = _Rv.T @ _delt / 1000.0                               # metres, body frame
+        _fwd  = float(np.clip(_db[0], 0.40, 0.75))
+        _lat  = float(np.clip(_db[1], -0.30, 0.30))
+        # Rotate clamped body-frame offset into SDK vision frame
+        cx, cy, _ = vision_T_body.rot.transform_point(_fwd, _lat, 0.0)
+        arm_x = vision_T_body.x + cx
+        arm_y = vision_T_body.y + cy
         robot_logger.info(
-            "Canvas centre in body frame: fwd=%.0f mm  lat=%.0f mm  (arm target)",
-            _db[0], _db[1])
+            "Canvas centre → arm target: vision (%.3f, %.3f, %.3f)  "
+            "body fwd=%.0f mm  lat=%.0f mm",
+            arm_x, arm_y, arm_z, _fwd * 1000, _lat * 1000)
     else:
         robot_logger.warning(
-            "Vicon canvas/body not visible — falling back to hardcoded %.0f mm forward",
+            "Vicon canvas/body not visible — using hardcoded %.0f mm forward",
             _ARM_REACH_IDEAL_MM)
-    flat_body_T_hand = SE3Pose(reach_m, lateral_m, -0.45, Quat(w=0.707, x=0, y=0.707, z=0))
-    (_, odom_T_flat_body, _, _, _, _) = get_transforms(False, robot_state)
-    odom_T_hand = odom_T_flat_body * flat_body_T_hand
-    p = odom_T_hand.to_proto()
 
     robot_logger.info("Moving arm to canvas centre…")
     arm_cmd = RobotCommandBuilder.arm_pose_command(
-        p.position.x,
-        p.position.y,
-        p.position.z,
-        p.rotation.w,
-        p.rotation.x,
-        p.rotation.y,
-        p.rotation.z,
-        ODOM_FRAME_NAME,
-        0.000001,
+        arm_x, arm_y, arm_z,
+        hand_quat.w, hand_quat.x, hand_quat.y, hand_quat.z,
+        VISION_FRAME_NAME,
+        3.0,
     )
     cmd_client.robot_command(RobotCommandBuilder.build_synchro_command(arm_cmd))
-    if not _ctrl.sleep(3.0):  # waits up to 3 s, checking estop every 50 ms
+    if not _ctrl.sleep(3.5):
         return False
 
     # ── Confirm before touching down ──────────────────────────────────────
@@ -647,15 +656,36 @@ def _draw_file(
 
 
 # ---------------------------------------------------------------------------
+# Arm stow helper
+# ---------------------------------------------------------------------------
+
+
+def _stow_arm_blocking(cmd_client) -> None:
+    """
+    Send arm_stow and block until the arm actually reaches the stow position.
+    Uses block_until_arm_arrives so we wait for real completion instead of a
+    blind sleep — important when the arm is pulling off a surface after drawing.
+    Robot body is NOT commanded here; call blocking_stand / sit separately.
+    """
+    print("  Stowing arm…", flush=True)
+    try:
+        cmd_id = cmd_client.robot_command(RobotCommandBuilder.arm_stow_command())
+        block_until_arm_arrives(cmd_client, cmd_id, timeout_sec=10)
+    except Exception:
+        time.sleep(6)   # fallback: blind wait if feedback check fails
+    print("  Arm stowed.", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # Emergency-stop cleanup helper
 # ---------------------------------------------------------------------------
 
 
 def _do_estop_cleanup(cmd_client) -> None:
-    print("\n[ESTOP] Stowing arm and sitting…")
+    print("\n[ESTOP] Stowing arm…")
+    _stow_arm_blocking(cmd_client)
+    print("  Sitting…")
     try:
-        cmd_client.robot_command(RobotCommandBuilder.arm_stow_command())
-        time.sleep(4)  # stow from extended position takes ~3-4 s
         cmd_client.robot_command(RobotCommandBuilder.synchro_sit_command())
         time.sleep(2)
     except Exception:
@@ -667,7 +697,7 @@ def _do_estop_cleanup(cmd_client) -> None:
 # ---------------------------------------------------------------------------
 
 
-def run(vicon_client, robot) -> None:
+def run(vicon_client, robot, draw_speed: float = 1.0) -> None:
     cmd_client = robot.ensure_client(RobotCommandClient.default_service_name)
     state_client = robot.ensure_client(RobotStateClient.default_service_name)
     asc_client = robot.ensure_client(ArmSurfaceContactClient.default_service_name)
@@ -678,6 +708,9 @@ def run(vicon_client, robot) -> None:
     estop_ep.force_simple_setup()
 
     cfg = _load_cfg()
+    if draw_speed != 1.0:
+        cfg["velocity"] *= draw_speed
+        print(f"Draw speed ×{draw_speed:.2f}  →  velocity {cfg['velocity']:.3f} m/s")
 
     with (
         EstopKeepAlive(estop_ep),
@@ -746,13 +779,15 @@ def run(vicon_client, robot) -> None:
             # ── Stow arm after drawing ───────────────────────────────────
             # _draw_file already stows on success; this is a safety fallback
             # for the estop / error path where it returned early.
-            print("\n  Stowing arm…")
+            # block_until_arm_arrives ensures the arm is fully stowed before
+            # we proceed — blind time.sleep(4) was not enough when pulling
+            # the arm off the canvas surface.
+            print()
+            _stow_arm_blocking(cmd_client)
             try:
-                cmd_client.robot_command(RobotCommandBuilder.arm_stow_command())
-                time.sleep(4)  # stow from extended position takes ~3-4 s
+                blocking_stand(cmd_client, timeout_sec=10)
             except Exception:
                 pass
-            blocking_stand(cmd_client, timeout_sec=10)
 
             if not ok or not _ctrl.check():
                 break
@@ -782,10 +817,12 @@ def run(vicon_client, robot) -> None:
             # Loop back to gcode selection
 
         # ── Sit and exit ───────────────────────────────────────────────────
-        print("\nCleaning up — stowing arm and sitting…")
+        # IMPORTANT: always stow first, stand, then sit — never sit while the
+        # arm is extended or the robot will sit on top of the arm and break it.
+        print("\nCleaning up…")
+        _stow_arm_blocking(cmd_client)
         try:
-            cmd_client.robot_command(RobotCommandBuilder.arm_stow_command())
-            time.sleep(2)
+            blocking_stand(cmd_client, timeout_sec=10)
             cmd_client.robot_command(RobotCommandBuilder.synchro_sit_command())
             time.sleep(2)
         except Exception:
@@ -809,6 +846,13 @@ def main() -> None:
         "--vicon",
         metavar="HOST:PORT",
         help=f"Vicon address (default from .env: {VICON_ADDRESS})",
+    )
+    ap.add_argument(
+        "--draw-speed",
+        type=float,
+        default=1.0,
+        metavar="MULT",
+        help="velocity multiplier for drawing (0.5 = half speed, 2.0 = double, etc.)",
     )
     args = ap.parse_args()
 
@@ -849,7 +893,7 @@ def main() -> None:
     print("Spot connected.\n")
 
     try:
-        run(vicon, robot)
+        run(vicon, robot, draw_speed=args.draw_speed)
     finally:
         vicon.stop()
 
