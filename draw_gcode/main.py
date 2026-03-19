@@ -332,13 +332,25 @@ def _draw_file(
 
     wr1_T_tool = SE3Pose(0.23589 + tool_length, 0, 0, Quat(w=1, x=0, y=0, z=0))
 
-    # ── Center the gcode around its bounding box midpoint ────────────────
-    # This ensures gcode (0,0) in origin frame = center of the drawing,
-    # so the drawing is centered wherever the arm touches down.
+    # ── Corner-anchor: gcode (x_min, y_min) → canvas TL corner ──────────
+    # Touch-down is at canvas centre. The canvas TL corner is at
+    # (-width/2, -height/2) from centre in the gcode frame, so we set
+    # gcode_start = x_min + canvas_half_m / scale.  This guarantees all
+    # +X/+Y gcode coordinates stay within the canvas area.
     x_min, x_max, y_min, y_max = _scan_bounds(gcode_file)
-    gcode_start_x = (x_min + x_max) / 2.0
-    gcode_start_y = (y_min + y_max) / 2.0
-    robot_logger.info("Gcode center offset: (%.1f, %.1f)", gcode_start_x, gcode_start_y)
+    _canvas_vf = vicon_client.latest_frame
+    if _canvas_vf and _canvas_vf.canvas and _canvas_vf.canvas.is_valid():
+        gcode_start_x = x_min + (_canvas_vf.canvas.width_mm  / 1000.0) / (2.0 * scale)
+        gcode_start_y = y_min + (_canvas_vf.canvas.height_mm / 1000.0) / (2.0 * scale)
+        robot_logger.info(
+            "Corner-anchor: gcode(%.1f, %.1f) → canvas TL corner; "
+            "gcode_start=(%.2f, %.2f)",
+            x_min, y_min, gcode_start_x, gcode_start_y)
+    else:
+        gcode_start_x = (x_min + x_max) / 2.0
+        gcode_start_y = (y_min + y_max) / 2.0
+        robot_logger.warning(
+            "Canvas dims unavailable for corner-anchor — using centre-anchor fallback")
 
     gcode = GcodeReader(
         gcode_file,
@@ -409,15 +421,36 @@ def _draw_file(
             "fallback hover arm_z=%.3f",
             _ARM_REACH_IDEAL_MM, arm_z)
 
-    robot_logger.info("Moving arm to canvas centre…")
-    arm_cmd = RobotCommandBuilder.arm_pose_command(
-        arm_x, arm_y, arm_z,
+    # ── Two-phase arm move: safe height first, then lower to hover ───────
+    # Phase 1 — move arm to hover XY at flat-body level.  The arm travels
+    # laterally and forward at a height that is guaranteed above the floor
+    # (~48 cm) regardless of canvas-Z errors.  This prevents any downward
+    # slam during the horizontal transit.
+    safe_z = vision_T_flat_body.z - 0.05   # ~5 cm below flat body ≈ 48 cm
+    robot_logger.info(
+        "Phase 1 — arm to canvas XY at safe height z=%.3f…", safe_z)
+    safe_cmd = RobotCommandBuilder.arm_pose_command(
+        arm_x, arm_y, safe_z,
         hand_quat.w, hand_quat.x, hand_quat.y, hand_quat.z,
         VISION_FRAME_NAME,
         3.0,
     )
-    cmd_client.robot_command(RobotCommandBuilder.build_synchro_command(arm_cmd))
+    cmd_client.robot_command(RobotCommandBuilder.build_synchro_command(safe_cmd))
     if not _ctrl.sleep(3.5):
+        return False
+
+    # Phase 2 — lower straight down to hover height (12 cm above canvas).
+    # Only Z changes here, so there is no risk of sweeping across the floor.
+    robot_logger.info(
+        "Phase 2 — lowering to hover z=%.3f (12 cm above canvas)…", arm_z)
+    arm_cmd = RobotCommandBuilder.arm_pose_command(
+        arm_x, arm_y, arm_z,
+        hand_quat.w, hand_quat.x, hand_quat.y, hand_quat.z,
+        VISION_FRAME_NAME,
+        2.0,
+    )
+    cmd_client.robot_command(RobotCommandBuilder.build_synchro_command(arm_cmd))
+    if not _ctrl.sleep(2.5):
         return False
 
     # ── Confirm before touching down ──────────────────────────────────────
@@ -601,8 +634,14 @@ def _draw_file(
 
             if vision_T_goals is None:
                 robot_logger.info("Gcode program finished.")
-                # 1. Lift off paper so the marker doesn't drag during stow.
+
+                # 1. Exit force/admittance control and lift arm well above the
+                #    floor.  travel_z (5 cm) is nowhere near enough clearance
+                #    for stow — target flat-body height instead (~43 cm).
                 robot_state = state_client.get_robot_state()
+                (_, vision_T_flat_body_now, _, _, _, _) = get_transforms(
+                    True, robot_state
+                )
                 vt_wr1 = get_a_tform_b(
                     robot_state.kinematic_state.transforms_snapshot,
                     VISION_FRAME_NAME,
@@ -610,28 +649,62 @@ def _draw_file(
                 )
                 vt_tool = vt_wr1 * wr1_T_tool
                 ep = vt_tool.to_proto()
+                lift_z = vision_T_flat_body_now.z - 0.10  # ~43 cm — stow-safe
                 lift = RobotCommandBuilder.arm_pose_command(
                     ep.position.x,
                     ep.position.y,
-                    touch_z + travel_z,
+                    lift_z,
                     ep.rotation.w,
                     ep.rotation.x,
                     ep.rotation.y,
                     ep.rotation.z,
                     VISION_FRAME_NAME,
-                    2.0,
+                    3.0,
                 )
-                cmd_client.robot_command(
-                    RobotCommandBuilder.build_synchro_command(lift)
-                )
-                _ctrl.sleep(2.0)
-                # 2. Stow arm fully before returning — callers must not need to stow.
-                robot_logger.info("Stowing arm…")
+                robot_logger.info(
+                    "Lifting arm off canvas to z=%.3f before stow…", lift_z)
                 try:
-                    cmd_client.robot_command(RobotCommandBuilder.arm_stow_command())
+                    lift_id = cmd_client.robot_command(
+                        RobotCommandBuilder.build_synchro_command(lift)
+                    )
+                    block_until_arm_arrives(cmd_client, lift_id, timeout_sec=5)
                 except Exception:
-                    pass
-                _ctrl.sleep(4.0)  # stow from extended position takes ~3-4 s
+                    _ctrl.sleep(3.5)  # fallback if feedback unavailable
+
+                # 2. Stow arm.  If it fails, ask the operator to manually clear
+                #    the arm (physically or via tablet teleop), then retry once.
+                robot_logger.info("Stowing arm…")
+                stow_ok = False
+                for _attempt in range(2):
+                    try:
+                        cmd_id = cmd_client.robot_command(
+                            RobotCommandBuilder.arm_stow_command()
+                        )
+                        block_until_arm_arrives(
+                            cmd_client, cmd_id, timeout_sec=10)
+                        stow_ok = True
+                        break
+                    except Exception as exc:
+                        robot_logger.warning(
+                            "Stow attempt %d failed: %s", _attempt + 1, exc)
+                        _ctrl.sleep(1.0)
+
+                if not stow_ok:
+                    print(
+                        "\n[WARN] Arm did not stow automatically.\n"
+                        "  Manually raise the arm to a safe position\n"
+                        "  (physically or via tablet teleop), then press ENTER."
+                    )
+                    _ctrl.wait_confirm("")
+                    try:
+                        cmd_id = cmd_client.robot_command(
+                            RobotCommandBuilder.arm_stow_command()
+                        )
+                        block_until_arm_arrives(
+                            cmd_client, cmd_id, timeout_sec=10)
+                    except Exception:
+                        pass
+
                 return True
 
             if not _ctrl.check():
