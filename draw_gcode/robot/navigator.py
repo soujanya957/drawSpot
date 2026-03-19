@@ -157,17 +157,26 @@ def _walk_to_point(cmd_client, vicon_client,
     """
     Walk to target_mm (world XY, in mm) until within stop_mm.
     Prints progress once per second. Returns False if estop fires.
+
+    Uses Vicon's predicted position when the body is occluded (some markers
+    temporarily blocked) — Vicon still provides a valid pose in that case.
+    Only blocks if spot_body is None (subject completely lost).
     """
     print(f"  Walking to {label}…")
     last_print = 0.0
+    _no_body_warned = False
     while True:
         if not _ctrl.check():
             return False
 
         frame = vicon_client.latest_frame
-        if frame is None or frame.spot_body is None or frame.spot_body.occluded:
+        if frame is None or frame.spot_body is None:
+            if not _no_body_warned:
+                print("    [WAIT] spot_base not visible in Vicon — waiting for tracking…")
+                _no_body_warned = True
             time.sleep(0.05)
             continue
+        _no_body_warned = False
 
         body = frame.spot_body
         dist = float(np.linalg.norm(body.position[:2] - target_mm[:2]))
@@ -176,7 +185,8 @@ def _walk_to_point(cmd_client, vicon_client,
         if now - last_print >= 1.0:
             bx, by = body.position[:2]
             tx, ty = target_mm[:2]
-            print(f"    Spot ({bx:+7.0f}, {by:+7.0f}) mm"
+            occ_tag = " [occluded]" if body.occluded else ""
+            print(f"    Spot ({bx:+7.0f}, {by:+7.0f}) mm{occ_tag}"
                   f"  →  {label} ({tx:+7.0f}, {ty:+7.0f}) mm"
                   f"  dist {dist:.0f} mm")
             last_print = now

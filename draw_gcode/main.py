@@ -248,7 +248,6 @@ def _walk_arm_to_canvas_center(vicon_client, cmd_client) -> bool:
             or frame.canvas is None
             or not frame.canvas.is_valid()
             or frame.spot_body is None
-            or frame.spot_body.occluded
         ):
             time.sleep(0.1)
             continue
