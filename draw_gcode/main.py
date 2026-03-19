@@ -368,7 +368,10 @@ def _draw_file(
     robot_state = state_client.get_robot_state()
     (vision_T_body, vision_T_flat_body, _, _, _, _) = get_transforms(True, robot_state)
     hand_quat = Quat(w=0.707, x=0, y=0.707, z=0)
-    arm_z = vision_T_flat_body.z - 0.25   # hover height in vision frame
+    # Fallback hover: keeps marker tip ~12 cm above floor when Vicon unavailable.
+    # (body height ~0.53 m above floor; hand tip = arm_z - 0.23589 - tool_length;
+    #  0.15 below flat_body gives tip ≈ 0.14 m above floor for tool_length=0)
+    arm_z = vision_T_flat_body.z - 0.15
 
     # Default XY: ideal reach forward, no lateral offset
     _dflt_x, _dflt_y, _ = vision_T_flat_body.rot.transform_point(
@@ -386,18 +389,25 @@ def _draw_file(
         _db   = _Rv.T @ _delt / 1000.0                               # metres, body frame
         _fwd  = float(np.clip(_db[0], 0.40, 0.75))
         _lat  = float(np.clip(_db[1], -0.30, 0.30))
-        # Rotate clamped body-frame offset into SDK vision frame
+        # Rotate clamped body-frame offset into SDK vision frame for XY
         cx, cy, _ = vision_T_body.rot.transform_point(_fwd, _lat, 0.0)
         arm_x = vision_T_body.x + cx
         arm_y = vision_T_body.y + cy
+        # Canvas Z in SDK vision frame: rotate body→canvas Z delta into vision frame.
+        # Hand must be 12 cm above canvas tip + tool tip offset so touch-to-find-ground
+        # can press down to the surface (marker hovers above, does NOT slam down).
+        _, _, _cz = vision_T_body.rot.transform_point(0.0, 0.0, float(_db[2]))
+        _canvas_z_vision = vision_T_body.z + _cz
+        arm_z = _canvas_z_vision + 0.12 + 0.23589 + tool_length
         robot_logger.info(
             "Canvas centre → arm target: vision (%.3f, %.3f, %.3f)  "
-            "body fwd=%.0f mm  lat=%.0f mm",
-            arm_x, arm_y, arm_z, _fwd * 1000, _lat * 1000)
+            "canvas_z=%.3f  body fwd=%.0f mm  lat=%.0f mm",
+            arm_x, arm_y, arm_z, _canvas_z_vision, _fwd * 1000, _lat * 1000)
     else:
         robot_logger.warning(
-            "Vicon canvas/body not visible — using hardcoded %.0f mm forward",
-            _ARM_REACH_IDEAL_MM)
+            "Vicon canvas/body not visible — using hardcoded %.0f mm forward, "
+            "fallback hover arm_z=%.3f",
+            _ARM_REACH_IDEAL_MM, arm_z)
 
     robot_logger.info("Moving arm to canvas centre…")
     arm_cmd = RobotCommandBuilder.arm_pose_command(
