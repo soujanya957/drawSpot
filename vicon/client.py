@@ -102,9 +102,9 @@ class ViconClient(ViconClientBase):
     or 250 Hz depending on capture settings).
     """
 
-    SPOT_SUBJECT   = "spot_base"
-    EE_SUBJECT     = "spot_ee"
-    BRUSH_SUBJECT  = "BrushTip"   # optional — frames have brush_tip=None if absent
+    SPOT_SUBJECT = "spot_base"
+    EE_SUBJECT = "spot_ee"
+    BRUSH_SUBJECT = "BrushTip"  # optional — frames have brush_tip=None if absent
     CANVAS_SUBJECT = "test_canvas"
     CANVAS_MARKERS = ("test_canvas1", "test_canvas2", "test_canvas3", "test_canvas4")
 
@@ -162,11 +162,13 @@ class ViconClient(ViconClientBase):
                 continue
             mpos, mocc = client.get_marker_global_translation(subject, mname)
             if mpos is not None:
-                markers.append(Marker(
-                    name=mname,
-                    position=np.array(mpos, dtype=float),
-                    occluded=bool(mocc),
-                ))
+                markers.append(
+                    Marker(
+                        name=mname,
+                        position=np.array(mpos, dtype=float),
+                        occluded=bool(mocc),
+                    )
+                )
 
         return RigidBody(
             name=subject,
@@ -180,7 +182,9 @@ class ViconClient(ViconClientBase):
         pos, occ = client.get_marker_global_translation(subject, subject)
         if pos is None:
             return None
-        return Marker(name=subject, position=np.array(pos, dtype=float), occluded=bool(occ))
+        return Marker(
+            name=subject, position=np.array(pos, dtype=float), occluded=bool(occ)
+        )
 
     def _get_canvas(self, client) -> Optional[CanvasFrame]:
         pts: list = []
@@ -195,7 +199,7 @@ class ViconClient(ViconClientBase):
         # Sort into TL, TR, BR, BL by X then Y (works for any marker numbering).
         # Assumes canvas lies roughly in the XY plane (Z is the normal axis).
         by_x = sorted(pts, key=lambda p: p[0])
-        left  = sorted(by_x[:2], key=lambda p: p[1])  # [low-Y, high-Y]
+        left = sorted(by_x[:2], key=lambda p: p[1])  # [low-Y, high-Y]
         right = sorted(by_x[2:], key=lambda p: p[1])  # [low-Y, high-Y]
         # TL=left[0], TR=right[0], BR=right[1], BL=left[1]
         return CanvasFrame(corners=[left[0], right[0], right[1], left[1]])
