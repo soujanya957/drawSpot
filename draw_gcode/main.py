@@ -341,19 +341,22 @@ def _draw_file(
     )
 
     wr1_T_tool = SE3Pose(0.23589 + tool_length, 0, 0, Quat(w=1, x=0, y=0, z=0))
+    canvas_z_vision = None  # populated below if Vicon canvas Z is available
 
-    # ── Corner-anchor: gcode (x_min, y_min) → canvas TL corner ──────────
-    # Touch-down is at canvas centre. The canvas TL corner is at
-    # (-width/2, -height/2) from centre in the gcode frame, so we set
-    # gcode_start = x_min + canvas_half_m / scale.  This guarantees all
-    # +X/+Y gcode coordinates stay within the canvas area.
+    # ── Corner-anchor: gcode (x_min, y_min) → canvas BL corner (near-left) ─
+    # Touch-down is at canvas centre (origin frame).  flip_y=True negates
+    # the gcode Y axis so that gcode +Y → body-right = canvas width direction.
+    # With gcode_start_y = y_min + height/(2*scale), at gcode Y=y_min:
+    #   y = -(y_min - gcode_start_y)*scale = +height/2  (body left = near-left) ✓
+    # This places gcode (x_min, y_min) at the near-left (BL) canvas corner,
+    # matching standard gcode convention (origin = bottom-left of drawing).
     x_min, x_max, y_min, y_max = _scan_bounds(gcode_file)
     _canvas_vf = vicon_client.latest_frame
     if _canvas_vf and _canvas_vf.canvas and _canvas_vf.canvas.is_valid():
         gcode_start_x = x_min + (_canvas_vf.canvas.width_mm  / 1000.0) / (2.0 * scale)
         gcode_start_y = y_min + (_canvas_vf.canvas.height_mm / 1000.0) / (2.0 * scale)
         robot_logger.info(
-            "Corner-anchor: gcode(%.1f, %.1f) → canvas TL corner; "
+            "Corner-anchor: gcode(%.1f, %.1f) → canvas BL corner (near-left); "
             "gcode_start=(%.2f, %.2f)",
             x_min, y_min, gcode_start_x, gcode_start_y)
     else:
@@ -374,6 +377,7 @@ def _draw_file(
         gcode_start_y,
         draw_z_offset,
         flip_goal_quat=True,  # draw_gcode origin: +X=body-forward; gcode_manual uses -X
+        flip_y=True,          # gcode +Y→body-right; our frame +Y=body-left → negate Y
     )
 
     # ── Walk body so canvas centre is at ideal arm distance, then lock base ─
@@ -421,6 +425,7 @@ def _draw_file(
         # can press down to the surface (marker hovers above, does NOT slam down).
         _, _, _cz = vision_T_body.rot.transform_point(0.0, 0.0, float(_db[2]))
         _canvas_z_vision = vision_T_body.z + _cz
+        canvas_z_vision = _canvas_z_vision  # save for post-touch tool_length calibration
         arm_z = _canvas_z_vision + 0.12 + 0.23589 + tool_length
         robot_logger.info(
             "Canvas centre → arm target: vision (%.3f, %.3f, %.3f)  "
@@ -513,6 +518,38 @@ def _draw_file(
 
     vision_T_wr1 = get_a_tform_b(snap, VISION_FRAME_NAME, WR1_FRAME_NAME, validate=True)
     vision_T_tool = vision_T_wr1 * wr1_T_tool
+
+    # ── Auto-calibrate tool_length from WR1 pose + Vicon canvas Z ────────
+    # At touch the marker tip is on the canvas surface, so:
+    #   canvas_z = WR1_z + (0.23589 + tool_length) × (WR1 X-axis Z component)
+    # Solving for tool_length accounts for actual arm angle — no assumptions.
+    if canvas_z_vision is not None:
+        _tdx, _tdy, _tdz = vision_T_wr1.rot.transform_point(1.0, 0.0, 0.0)
+        if abs(_tdz) > 0.1:  # arm has meaningful downward component; avoid ÷0
+            _total_ext = (canvas_z_vision - vision_T_wr1.z) / _tdz
+            _measured_tl = _total_ext - 0.23589
+            if 0.0 <= _measured_tl <= 0.30:
+                robot_logger.info(
+                    "Auto-calibrated tool_length: cfg=%.1f mm → measured=%.1f mm"
+                    "  (WR1 arm_z_hat=%.3f  total_ext=%.1f mm)",
+                    tool_length * 1000, _measured_tl * 1000, _tdz, _total_ext * 1000,
+                )
+                tool_length = _measured_tl
+                wr1_T_tool = SE3Pose(0.23589 + tool_length, 0, 0, Quat(w=1, x=0, y=0, z=0))
+                vision_T_tool = vision_T_wr1 * wr1_T_tool
+            else:
+                robot_logger.warning(
+                    "Auto-calibrated tool_length %.1f mm out of range [0–300 mm]"
+                    " — keeping cfg %.1f mm",
+                    _measured_tl * 1000, tool_length * 1000,
+                )
+        else:
+            robot_logger.warning(
+                "WR1 arm_z_hat=%.3f too small for tool_length calibration"
+                " — keeping cfg %.1f mm",
+                _tdz, tool_length * 1000,
+            )
+
     ground_plane_rt_vision[2] = vision_T_tool.z + cfg["touch_z_offset"]  # pin Z to touch point ± offset
     robot_logger.info(
         "Touch Z: %.4f m  touch_z_offset: %+.1f mm  → drawing Z ref: %.4f m",
@@ -530,9 +567,9 @@ def _draw_file(
     # onto the horizontal plane and enforce z=[0,0,1] so the arm points straight
     # down throughout (no tilt) — identical to gcode_manual/gcode.py set_origin().
     #
-    # gcode +X  = body forward  = canvas TL→TR  (width direction)
-    # gcode +Y  = body left     = canvas TL→BL  (height direction)
-    # gcode(0,0)= canvas centre (gcode_start_x/y = bounding-box centre above)
+    # gcode +X  = body forward  = canvas depth (near→far)
+    # gcode +Y  = body right    = canvas width (left→right), because flip_y=True
+    # gcode(x_min,y_min) = canvas BL corner (near-left, standard bottom-left origin)
     zhat = np.array([0.0, 0.0, 1.0])
     bfwd = list(vision_T_body.rot.transform_point(1.0, 0.0, 0.0))
     xhat = make_orthogonal(zhat, bfwd)  # body forward projected to horizontal

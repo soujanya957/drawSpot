@@ -142,6 +142,7 @@ class GcodeReader:
         gcode_start_y=0,
         draw_z_offset=0.0,
         flip_goal_quat=False,
+        flip_y=False,
     ):
         self.file = open(file_path, "r")
         self.tool_length = tool_length
@@ -154,6 +155,7 @@ class GcodeReader:
         self.gcode_start_y = gcode_start_y
         self.draw_z_offset = draw_z_offset
         self.flip_goal_quat = flip_goal_quat
+        self.flip_y = flip_y
         self.current_origin_T_goals = None
         self.last_x = self.last_y = self.last_z = 0
         self._last_line = ""
@@ -210,7 +212,8 @@ class GcodeReader:
                 if p[0] == "X":
                     x = (float(p[1:]) - self.gcode_start_x) * self.scale
                 elif p[0] == "Y":
-                    y = (float(p[1:]) - self.gcode_start_y) * self.scale
+                    raw_y = (float(p[1:]) - self.gcode_start_y) * self.scale
+                    y = -raw_y if self.flip_y else raw_y
                 elif p[0] == "Z":
                     z = float(p[1:]) * self.scale
             self.last_x, self.last_y, self.last_z = x, y, z
@@ -223,16 +226,20 @@ class GcodeReader:
                 if p[0] == "X":
                     x = (float(p[1:]) - self.gcode_start_x) * self.scale
                 elif p[0] == "Y":
-                    y = (float(p[1:]) - self.gcode_start_y) * self.scale
+                    raw_y = (float(p[1:]) - self.gcode_start_y) * self.scale
+                    y = -raw_y if self.flip_y else raw_y
                 elif p[0] == "Z":
                     z = float(p[1:]) * self.scale
                 elif p[0] == "I":
                     i_val = float(p[1:]) * self.scale
                 elif p[0] == "J":
-                    j_val = float(p[1:]) * self.scale
+                    raw_j = float(p[1:]) * self.scale
+                    j_val = -raw_j if self.flip_y else raw_j
                 elif p[0] == "K":
                     k_val = float(p[1:]) * self.scale
             clockwise = parts[0] in ("G02", "G2")
+            if self.flip_y:
+                clockwise = not clockwise
             if i_val != 0 or j_val != 0:
                 lp = [self.last_x, self.last_y]
                 ep = [x, y]
