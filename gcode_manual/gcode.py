@@ -141,6 +141,7 @@ class GcodeReader:
         gcode_start_x=0,
         gcode_start_y=0,
         draw_z_offset=0.0,
+        flip_goal_quat=False,
     ):
         self.file = open(file_path, "r")
         self.tool_length = tool_length
@@ -152,6 +153,7 @@ class GcodeReader:
         self.gcode_start_x = gcode_start_x
         self.gcode_start_y = gcode_start_y
         self.draw_z_offset = draw_z_offset
+        self.flip_goal_quat = flip_goal_quat
         self.current_origin_T_goals = None
         self.last_x = self.last_y = self.last_z = 0
         self._last_line = ""
@@ -184,8 +186,10 @@ class GcodeReader:
     def _goal_quat(self):
         if not self.draw_on_wall:
             xhat = np.array([0, 0, -1], dtype=float)
-            zhat = np.array([-1, 0, 0], dtype=float)
-            yhat = np.cross(zhat, xhat)  # = [0, -1, 0]
+            # flip_goal_quat=True (draw_gcode): origin +X = body forward → gripper faces forward
+            # flip_goal_quat=False (gcode_manual): origin +X = body backward → gripper faces forward
+            zhat = np.array([1, 0, 0] if self.flip_goal_quat else [-1, 0, 0], dtype=float)
+            yhat = np.cross(zhat, xhat)
             mat = np.array([xhat, yhat, zhat]).T
         else:
             mat = np.array([[0, 0, -1], [-1, 0, 0], [0, 1, 0]], dtype=float).T

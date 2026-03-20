@@ -118,12 +118,17 @@ def _arm_body(cmd_client, x, y, z, quat, dur_s=2.0):
 
 _YAW_DRIVE_THRESHOLD = 0.4   # rad (~23°) — rotate-only below this before driving
 
+
 def _nav_step(cmd_client, body, target_mm: np.ndarray, stop_mm: float) -> bool:
     """One tick toward target_mm. Returns True when within stop_mm.
 
     Rotate-first strategy: if yaw error exceeds _YAW_DRIVE_THRESHOLD, spin in
     place until roughly aligned, then drive forward with minor yaw correction.
-    This prevents the robot from spinning endlessly when the target is to its side.
+
+    Near ±π (target almost exactly behind the robot), atan2 can flip sign on
+    consecutive ticks causing oscillation.  For |yaw_err| > 0.95π we skip the
+    proportional gain and always rotate CCW at max speed — both directions are
+    equally long so the choice is arbitrary, but it must be consistent.
     """
     pos   = body.position[:2]
     delta = target_mm[:2] - pos
@@ -136,8 +141,12 @@ def _nav_step(cmd_client, body, target_mm: np.ndarray, stop_mm: float) -> bool:
     yaw_err  = math.atan2(float(dir_body[1]), float(dir_body[0]))
 
     if abs(yaw_err) > _YAW_DRIVE_THRESHOLD:
-        # Rotate in place toward target — no forward motion
-        v_rot = float(np.clip(yaw_err * 2.0, -0.5, 0.5))
+        # Rotate in place toward target.
+        # Near ±π use fixed CCW rate to avoid sign-flip oscillation.
+        if abs(yaw_err) > math.pi * 0.95:
+            v_rot = 0.5
+        else:
+            v_rot = float(np.clip(yaw_err * 2.0, -0.5, 0.5))
         cmd_client.robot_command(
             RobotCommandBuilder.synchro_velocity_command(v_x=0, v_y=0, v_rot=v_rot),
             end_time_secs=time.time() + BASE_CMD_DUR,
@@ -158,25 +167,27 @@ def _walk_to_point(cmd_client, vicon_client,
     Walk to target_mm (world XY, in mm) until within stop_mm.
     Prints progress once per second. Returns False if estop fires.
 
-    Uses Vicon's predicted position when the body is occluded (some markers
-    temporarily blocked) — Vicon still provides a valid pose in that case.
-    Only blocks if spot_body is None (subject completely lost).
+    Blocks (with a periodic warning) whenever spot_body is None or occluded so
+    that stale Vicon predictions never drive the navigation loop.
     """
     print(f"  Walking to {label}…")
     last_print = 0.0
-    _no_body_warned = False
+    _warn_t = 0.0
     while True:
         if not _ctrl.check():
             return False
 
         frame = vicon_client.latest_frame
-        if frame is None or frame.spot_body is None:
-            if not _no_body_warned:
-                print("    [WAIT] spot_base not visible in Vicon — waiting for tracking…")
-                _no_body_warned = True
+        if frame is None or frame.spot_body is None or frame.spot_body.occluded:
+            now = time.time()
+            if now - _warn_t >= 3.0:
+                reason = ("no frame" if frame is None
+                          else "spot_base None" if frame.spot_body is None
+                          else "spot_base occluded")
+                print(f"    [WAIT] Vicon: {reason} — waiting for clear tracking…")
+                _warn_t = now
             time.sleep(0.05)
             continue
-        _no_body_warned = False
 
         body = frame.spot_body
         dist = float(np.linalg.norm(body.position[:2] - target_mm[:2]))
@@ -185,8 +196,7 @@ def _walk_to_point(cmd_client, vicon_client,
         if now - last_print >= 1.0:
             bx, by = body.position[:2]
             tx, ty = target_mm[:2]
-            occ_tag = " [occluded]" if body.occluded else ""
-            print(f"    Spot ({bx:+7.0f}, {by:+7.0f}) mm{occ_tag}"
+            print(f"    Spot ({bx:+7.0f}, {by:+7.0f}) mm"
                   f"  →  {label} ({tx:+7.0f}, {ty:+7.0f}) mm"
                   f"  dist {dist:.0f} mm")
             last_print = now

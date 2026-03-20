@@ -100,6 +100,10 @@ def _load_cfg() -> dict:
         use_vision_frame=g.getboolean("use_vision_frame", True),
         use_xy_cross=g.getboolean("use_xy_to_z_cross_term", False),
         bias_force_x=g.getfloat("bias_force_x", 0.0),
+        touch_z_offset=g.getfloat("touch_z_offset_mm", 0.0) / 1000.0,
+        canvas_margin=g.getfloat("canvas_margin", 0.80),
+        arm_draw_x=g.getfloat("arm_draw_x_mm", 300.0) / 1000.0,
+        arm_draw_y=g.getfloat("arm_draw_y_mm", 440.0) / 1000.0,
     )
 
 
@@ -181,16 +185,22 @@ def _scan_bounds(gcode_path: str):
     return min(x_vals), max(x_vals), min(y_vals), max(y_vals)
 
 
-def compute_scale(gcode_path: str, canvas, margin: float = 0.90) -> float:
-    """Return scale (m/unit) that fits gcode within margin fraction of the canvas."""
+def compute_scale(
+    gcode_path: str,
+    canvas,
+    margin: float = 0.90,
+    arm_draw_x_m: float = 0.30,
+    arm_draw_y_m: float = 0.44,
+) -> float:
+    """Return scale (m/unit) that fits gcode within the canvas margin AND arm workspace limits."""
     x_min, x_max, y_min, y_max = _scan_bounds(gcode_path)
     gw = x_max - x_min
     gh = y_max - y_min
     if gw <= 0 or gh <= 0:
         print("  [WARN] Cannot determine gcode extents — using 0.001 m/unit")
         return 0.001
-    cw = (canvas.width_mm / 1000.0) * margin
-    ch = (canvas.height_mm / 1000.0) * margin
+    cw = min((canvas.width_mm / 1000.0) * margin, arm_draw_x_m)
+    ch = min((canvas.height_mm / 1000.0) * margin, arm_draw_y_m)
     scale = min(cw / gw, ch / gh)
     cx = (x_min + x_max) / 2.0
     cy = (y_min + y_max) / 2.0
@@ -200,6 +210,7 @@ def compute_scale(gcode_path: str, canvas, margin: float = 0.90) -> float:
     print(
         f"  Canvas         {canvas.width_mm:.0f} × {canvas.height_mm:.0f} mm"
         f"  (margin {margin * 100:.0f}%)"
+        f"  arm limit {arm_draw_x_m * 1000:.0f} × {arm_draw_y_m * 1000:.0f} mm"
     )
     print(
         f"  Auto-scale     {scale:.6f} m/unit"
@@ -362,6 +373,7 @@ def _draw_file(
         gcode_start_x,
         gcode_start_y,
         draw_z_offset,
+        flip_goal_quat=True,  # draw_gcode origin: +X=body-forward; gcode_manual uses -X
     )
 
     # ── Walk body so canvas centre is at ideal arm distance, then lock base ─
@@ -482,6 +494,7 @@ def _draw_file(
         bias_force_x,
     )
     if not _ctrl.sleep(8.0):  # wait for surface contact; checks estop every 50 ms
+        _emergency_lift_arm(state_client, cmd_client, wr1_T_tool)
         return False
 
     # ── Re-read state after touchdown ─────────────────────────────────────
@@ -500,7 +513,11 @@ def _draw_file(
 
     vision_T_wr1 = get_a_tform_b(snap, VISION_FRAME_NAME, WR1_FRAME_NAME, validate=True)
     vision_T_tool = vision_T_wr1 * wr1_T_tool
-    ground_plane_rt_vision[2] = vision_T_tool.z  # pin Z to actual touch point
+    ground_plane_rt_vision[2] = vision_T_tool.z + cfg["touch_z_offset"]  # pin Z to touch point ± offset
+    robot_logger.info(
+        "Touch Z: %.4f m  touch_z_offset: %+.1f mm  → drawing Z ref: %.4f m",
+        vision_T_tool.z, cfg["touch_z_offset"] * 1000.0, ground_plane_rt_vision[2],
+    )
 
     # ── Set gcode origin at the ACTUAL TOUCH POINT ────────────────────────
     #
@@ -590,6 +607,7 @@ def _draw_file(
 
     while True:
         if not _ctrl.check():
+            _emergency_lift_arm(state_client, cmd_client, wr1_T_tool)
             return False
 
         robot_state = state_client.get_robot_state()
@@ -626,6 +644,7 @@ def _draw_file(
 
             while is_pause:
                 if not _ctrl.wait_confirm("M0 pause — press ENTER to continue."):
+                    _emergency_lift_arm(state_client, cmd_client, wr1_T_tool)
                     return False
                 (is_admittance, vision_T_goals, is_pause) = (
                     gcode.get_next_vision_T_goals(ground_plane_rt_vision)
@@ -641,34 +660,26 @@ def _draw_file(
                 (_, vision_T_flat_body_now, _, _, _, _) = get_transforms(
                     True, robot_state
                 )
-                vt_wr1 = get_a_tform_b(
-                    robot_state.kinematic_state.transforms_snapshot,
-                    VISION_FRAME_NAME,
-                    WR1_FRAME_NAME,
-                )
-                vt_tool = vt_wr1 * wr1_T_tool
-                ep = vt_tool.to_proto()
-                lift_z = vision_T_flat_body_now.z - 0.10  # ~43 cm — stow-safe
+                # Move to centred body-frame position before stow.
+                # Lifting straight up from the last draw position leaves the
+                # arm at whatever lateral extreme it finished at, which can
+                # put it in an under-body configuration that blocks stow.
+                _hand_q = Quat(w=0.707, x=0, y=0.707, z=0)
+                _ax, _ay, _az = vision_T_flat_body_now.transform_point(0.65, 0.0, 0.15)
                 lift = RobotCommandBuilder.arm_pose_command(
-                    ep.position.x,
-                    ep.position.y,
-                    lift_z,
-                    ep.rotation.w,
-                    ep.rotation.x,
-                    ep.rotation.y,
-                    ep.rotation.z,
+                    _ax, _ay, _az,
+                    _hand_q.w, _hand_q.x, _hand_q.y, _hand_q.z,
                     VISION_FRAME_NAME,
-                    3.0,
+                    4.0,
                 )
-                robot_logger.info(
-                    "Lifting arm off canvas to z=%.3f before stow…", lift_z)
+                robot_logger.info("Moving arm to centred pre-stow position…")
                 try:
                     lift_id = cmd_client.robot_command(
                         RobotCommandBuilder.build_synchro_command(lift)
                     )
                     block_until_arm_arrives(cmd_client, lift_id, timeout_sec=5)
                 except Exception:
-                    _ctrl.sleep(3.5)  # fallback if feedback unavailable
+                    time.sleep(4)  # fallback if feedback unavailable
 
                 # 2. Stow arm.  If it fails, ask the operator to manually clear
                 #    the arm (physically or via tablet teleop), then retry once.
@@ -676,17 +687,16 @@ def _draw_file(
                 stow_ok = False
                 for _attempt in range(2):
                     try:
-                        cmd_id = cmd_client.robot_command(
+                        cmd_client.robot_command(
                             RobotCommandBuilder.arm_stow_command()
                         )
-                        block_until_arm_arrives(
-                            cmd_client, cmd_id, timeout_sec=10)
+                        time.sleep(6)  # stow feedback type incompatible with block_until_arm_arrives
                         stow_ok = True
                         break
                     except Exception as exc:
                         robot_logger.warning(
                             "Stow attempt %d failed: %s", _attempt + 1, exc)
-                        _ctrl.sleep(1.0)
+                        time.sleep(1.0)
 
                 if not stow_ok:
                     print(
@@ -707,6 +717,7 @@ def _draw_file(
                 return True
 
             if not _ctrl.check():
+                _emergency_lift_arm(state_client, cmd_client, wr1_T_tool)
                 return False
 
             move_arm(
@@ -744,18 +755,46 @@ def _draw_file(
 
 def _stow_arm_blocking(cmd_client) -> None:
     """
-    Send arm_stow and block until the arm actually reaches the stow position.
-    Uses block_until_arm_arrives so we wait for real completion instead of a
-    blind sleep — important when the arm is pulling off a surface after drawing.
+    Send arm_stow and wait long enough for the arm to reach the stow position.
+    Uses a plain sleep rather than block_until_arm_arrives because the stow
+    command's feedback type is not compatible with that helper and causes it to
+    throw immediately, which means the 6 s fallback sleep starts late.
     Robot body is NOT commanded here; call blocking_stand / sit separately.
     """
     print("  Stowing arm…", flush=True)
     try:
-        cmd_id = cmd_client.robot_command(RobotCommandBuilder.arm_stow_command())
-        block_until_arm_arrives(cmd_client, cmd_id, timeout_sec=10)
+        cmd_client.robot_command(RobotCommandBuilder.arm_stow_command())
     except Exception:
-        time.sleep(6)   # fallback: blind wait if feedback check fails
+        pass
+    time.sleep(6)  # stow takes up to ~4 s from any reasonable position
     print("  Arm stowed.", flush=True)
+
+
+def _emergency_lift_arm(state_client, cmd_client, wr1_T_tool) -> None:
+    """
+    Move the arm to a centered, stow-safe position using a standard arm_pose_command.
+    Called when ESC fires mid-draw to break out of ArmSurfaceContact mode.
+
+    Targets a body-frame centered position (65 cm forward, 0 cm lateral, 15 cm
+    above flat-body) so the arm is clear of both the canvas AND any lateral-extreme
+    under-body configuration before arm_stow_command is issued.
+    """
+    try:
+        robot_state = state_client.get_robot_state()
+        (_, vision_T_flat_body, _, _, _, _) = get_transforms(True, robot_state)
+        hand_quat = Quat(w=0.707, x=0, y=0.707, z=0)
+        # Transform body-frame safe position to vision frame:
+        # 0.65 m forward, 0.0 m lateral, 0.15 m above flat-body (centred, stow-safe)
+        ax, ay, az = vision_T_flat_body.transform_point(0.65, 0.0, 0.15)
+        lift_cmd = RobotCommandBuilder.arm_pose_command(
+            ax, ay, az,
+            hand_quat.w, hand_quat.x, hand_quat.y, hand_quat.z,
+            VISION_FRAME_NAME, 4.0,
+        )
+        lift_id = cmd_client.robot_command(RobotCommandBuilder.build_synchro_command(lift_cmd))
+        block_until_arm_arrives(cmd_client, lift_id, timeout_sec=5)
+    except Exception:
+        time.sleep(4)  # fallback wait if state read or arrival check fails
 
 
 # ---------------------------------------------------------------------------
@@ -835,7 +874,12 @@ def run(vicon_client, robot, draw_speed: float = 1.0) -> None:
             frame = vicon_client.latest_frame
             if frame and frame.canvas and frame.canvas.is_valid():
                 print("  Computing auto-scale from canvas…")
-                scale = compute_scale(gcode_path, frame.canvas)
+                scale = compute_scale(
+                    gcode_path, frame.canvas,
+                    margin=cfg["canvas_margin"],
+                    arm_draw_x_m=cfg["arm_draw_x"],
+                    arm_draw_y_m=cfg["arm_draw_y"],
+                )
             else:
                 print("  [WARN] Canvas not visible — using default scale 0.001 m/unit")
                 scale = 0.001
