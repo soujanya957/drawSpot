@@ -353,17 +353,22 @@ def _draw_file(
     x_min, x_max, y_min, y_max = _scan_bounds(gcode_file)
     _canvas_vf = vicon_client.latest_frame
     if _canvas_vf and _canvas_vf.canvas and _canvas_vf.canvas.is_valid():
-        gcode_start_x = x_min + (_canvas_vf.canvas.width_mm  / 1000.0) / (2.0 * scale)
+        gcode_start_x = x_min + (_canvas_vf.canvas.width_mm / 1000.0) / (2.0 * scale)
         gcode_start_y = y_min + (_canvas_vf.canvas.height_mm / 1000.0) / (2.0 * scale)
         robot_logger.info(
             "Corner-anchor: gcode(%.1f, %.1f) → canvas BL corner (near-left); "
             "gcode_start=(%.2f, %.2f)",
-            x_min, y_min, gcode_start_x, gcode_start_y)
+            x_min,
+            y_min,
+            gcode_start_x,
+            gcode_start_y,
+        )
     else:
         gcode_start_x = (x_min + x_max) / 2.0
         gcode_start_y = (y_min + y_max) / 2.0
         robot_logger.warning(
-            "Canvas dims unavailable for corner-anchor — using centre-anchor fallback")
+            "Canvas dims unavailable for corner-anchor — using centre-anchor fallback"
+        )
 
     gcode = GcodeReader(
         gcode_file,
@@ -377,7 +382,7 @@ def _draw_file(
         gcode_start_y,
         draw_z_offset,
         flip_goal_quat=True,  # draw_gcode origin: +X=body-forward; gcode_manual uses -X
-        flip_y=True,          # gcode +Y→body-right; our frame +Y=body-left → negate Y
+        flip_y=True,  # gcode +Y→body-right; our frame +Y=body-left → negate Y
     )
 
     # ── Walk body so canvas centre is at ideal arm distance, then lock base ─
@@ -402,20 +407,26 @@ def _draw_file(
 
     # Default XY: ideal reach forward, no lateral offset
     _dflt_x, _dflt_y, _ = vision_T_flat_body.rot.transform_point(
-        _ARM_REACH_IDEAL_MM / 1000.0, 0.0, 0.0)
+        _ARM_REACH_IDEAL_MM / 1000.0, 0.0, 0.0
+    )
     arm_x = vision_T_flat_body.x + _dflt_x
     arm_y = vision_T_flat_body.y + _dflt_y
 
     _vf = vicon_client.latest_frame
-    if (_vf and _vf.canvas and _vf.canvas.is_valid()
-            and _vf.spot_body and not _vf.spot_body.occluded):
+    if (
+        _vf
+        and _vf.canvas
+        and _vf.canvas.is_valid()
+        and _vf.spot_body
+        and not _vf.spot_body.occluded
+    ):
         # body→canvas delta in Vicon world frame, rotated to body frame
-        _ctr  = np.mean(np.array(_vf.canvas.corners), axis=0)
-        _delt = _ctr - np.array(_vf.spot_body.position)              # mm, Vicon world
-        _Rv   = _rotation_matrix(_vf.spot_body.rotation_quat)        # Vicon world ← body
-        _db   = _Rv.T @ _delt / 1000.0                               # metres, body frame
-        _fwd  = float(np.clip(_db[0], 0.40, 0.75))
-        _lat  = float(np.clip(_db[1], -0.30, 0.30))
+        _ctr = np.mean(np.array(_vf.canvas.corners), axis=0)
+        _delt = _ctr - np.array(_vf.spot_body.position)  # mm, Vicon world
+        _Rv = _rotation_matrix(_vf.spot_body.rotation_quat)  # Vicon world ← body
+        _db = _Rv.T @ _delt / 1000.0  # metres, body frame
+        _fwd = float(np.clip(_db[0], 0.40, 0.75))
+        _lat = float(np.clip(_db[1], -0.30, 0.30))
         # Rotate clamped body-frame offset into SDK vision frame for XY
         cx, cy, _ = vision_T_body.rot.transform_point(_fwd, _lat, 0.0)
         arm_x = vision_T_body.x + cx
@@ -425,29 +436,43 @@ def _draw_file(
         # can press down to the surface (marker hovers above, does NOT slam down).
         _, _, _cz = vision_T_body.rot.transform_point(0.0, 0.0, float(_db[2]))
         _canvas_z_vision = vision_T_body.z + _cz
-        canvas_z_vision = _canvas_z_vision  # save for post-touch tool_length calibration
+        canvas_z_vision = (
+            _canvas_z_vision  # save for post-touch tool_length calibration
+        )
         arm_z = _canvas_z_vision + 0.12 + 0.23589 + tool_length
         robot_logger.info(
             "Canvas centre → arm target: vision (%.3f, %.3f, %.3f)  "
             "canvas_z=%.3f  body fwd=%.0f mm  lat=%.0f mm",
-            arm_x, arm_y, arm_z, _canvas_z_vision, _fwd * 1000, _lat * 1000)
+            arm_x,
+            arm_y,
+            arm_z,
+            _canvas_z_vision,
+            _fwd * 1000,
+            _lat * 1000,
+        )
     else:
         robot_logger.warning(
             "Vicon canvas/body not visible — using hardcoded %.0f mm forward, "
             "fallback hover arm_z=%.3f",
-            _ARM_REACH_IDEAL_MM, arm_z)
+            _ARM_REACH_IDEAL_MM,
+            arm_z,
+        )
 
     # ── Two-phase arm move: safe height first, then lower to hover ───────
     # Phase 1 — move arm to hover XY at flat-body level.  The arm travels
     # laterally and forward at a height that is guaranteed above the floor
     # (~48 cm) regardless of canvas-Z errors.  This prevents any downward
     # slam during the horizontal transit.
-    safe_z = vision_T_flat_body.z - 0.05   # ~5 cm below flat body ≈ 48 cm
-    robot_logger.info(
-        "Phase 1 — arm to canvas XY at safe height z=%.3f…", safe_z)
+    safe_z = vision_T_flat_body.z - 0.05  # ~5 cm below flat body ≈ 48 cm
+    robot_logger.info("Phase 1 — arm to canvas XY at safe height z=%.3f…", safe_z)
     safe_cmd = RobotCommandBuilder.arm_pose_command(
-        arm_x, arm_y, safe_z,
-        hand_quat.w, hand_quat.x, hand_quat.y, hand_quat.z,
+        arm_x,
+        arm_y,
+        safe_z,
+        hand_quat.w,
+        hand_quat.x,
+        hand_quat.y,
+        hand_quat.z,
         VISION_FRAME_NAME,
         3.0,
     )
@@ -457,11 +482,15 @@ def _draw_file(
 
     # Phase 2 — lower straight down to hover height (12 cm above canvas).
     # Only Z changes here, so there is no risk of sweeping across the floor.
-    robot_logger.info(
-        "Phase 2 — lowering to hover z=%.3f (12 cm above canvas)…", arm_z)
+    robot_logger.info("Phase 2 — lowering to hover z=%.3f (12 cm above canvas)…", arm_z)
     arm_cmd = RobotCommandBuilder.arm_pose_command(
-        arm_x, arm_y, arm_z,
-        hand_quat.w, hand_quat.x, hand_quat.y, hand_quat.z,
+        arm_x,
+        arm_y,
+        arm_z,
+        hand_quat.w,
+        hand_quat.x,
+        hand_quat.y,
+        hand_quat.z,
         VISION_FRAME_NAME,
         2.0,
     )
@@ -532,28 +561,39 @@ def _draw_file(
                 robot_logger.info(
                     "Auto-calibrated tool_length: cfg=%.1f mm → measured=%.1f mm"
                     "  (WR1 arm_z_hat=%.3f  total_ext=%.1f mm)",
-                    tool_length * 1000, _measured_tl * 1000, _tdz, _total_ext * 1000,
+                    tool_length * 1000,
+                    _measured_tl * 1000,
+                    _tdz,
+                    _total_ext * 1000,
                 )
                 tool_length = _measured_tl
-                wr1_T_tool = SE3Pose(0.23589 + tool_length, 0, 0, Quat(w=1, x=0, y=0, z=0))
+                wr1_T_tool = SE3Pose(
+                    0.23589 + tool_length, 0, 0, Quat(w=1, x=0, y=0, z=0)
+                )
                 vision_T_tool = vision_T_wr1 * wr1_T_tool
             else:
                 robot_logger.warning(
                     "Auto-calibrated tool_length %.1f mm out of range [0–300 mm]"
                     " — keeping cfg %.1f mm",
-                    _measured_tl * 1000, tool_length * 1000,
+                    _measured_tl * 1000,
+                    tool_length * 1000,
                 )
         else:
             robot_logger.warning(
                 "WR1 arm_z_hat=%.3f too small for tool_length calibration"
                 " — keeping cfg %.1f mm",
-                _tdz, tool_length * 1000,
+                _tdz,
+                tool_length * 1000,
             )
 
-    ground_plane_rt_vision[2] = vision_T_tool.z + cfg["touch_z_offset"]  # pin Z to touch point ± offset
+    ground_plane_rt_vision[2] = (
+        vision_T_tool.z + cfg["touch_z_offset"]
+    )  # pin Z to touch point ± offset
     robot_logger.info(
         "Touch Z: %.4f m  touch_z_offset: %+.1f mm  → drawing Z ref: %.4f m",
-        vision_T_tool.z, cfg["touch_z_offset"] * 1000.0, ground_plane_rt_vision[2],
+        vision_T_tool.z,
+        cfg["touch_z_offset"] * 1000.0,
+        ground_plane_rt_vision[2],
     )
 
     # ── Set gcode origin at the ACTUAL TOUCH POINT ────────────────────────
@@ -704,8 +744,13 @@ def _draw_file(
                 _hand_q = Quat(w=0.707, x=0, y=0.707, z=0)
                 _ax, _ay, _az = vision_T_flat_body_now.transform_point(0.65, 0.0, 0.15)
                 lift = RobotCommandBuilder.arm_pose_command(
-                    _ax, _ay, _az,
-                    _hand_q.w, _hand_q.x, _hand_q.y, _hand_q.z,
+                    _ax,
+                    _ay,
+                    _az,
+                    _hand_q.w,
+                    _hand_q.x,
+                    _hand_q.y,
+                    _hand_q.z,
                     VISION_FRAME_NAME,
                     4.0,
                 )
@@ -724,15 +769,16 @@ def _draw_file(
                 stow_ok = False
                 for _attempt in range(2):
                     try:
-                        cmd_client.robot_command(
-                            RobotCommandBuilder.arm_stow_command()
-                        )
-                        time.sleep(6)  # stow feedback type incompatible with block_until_arm_arrives
+                        cmd_client.robot_command(RobotCommandBuilder.arm_stow_command())
+                        time.sleep(
+                            6
+                        )  # stow feedback type incompatible with block_until_arm_arrives
                         stow_ok = True
                         break
                     except Exception as exc:
                         robot_logger.warning(
-                            "Stow attempt %d failed: %s", _attempt + 1, exc)
+                            "Stow attempt %d failed: %s", _attempt + 1, exc
+                        )
                         time.sleep(1.0)
 
                 if not stow_ok:
@@ -746,8 +792,7 @@ def _draw_file(
                         cmd_id = cmd_client.robot_command(
                             RobotCommandBuilder.arm_stow_command()
                         )
-                        block_until_arm_arrives(
-                            cmd_client, cmd_id, timeout_sec=10)
+                        block_until_arm_arrives(cmd_client, cmd_id, timeout_sec=10)
                     except Exception:
                         pass
 
@@ -824,11 +869,19 @@ def _emergency_lift_arm(state_client, cmd_client, wr1_T_tool) -> None:
         # 0.65 m forward, 0.0 m lateral, 0.15 m above flat-body (centred, stow-safe)
         ax, ay, az = vision_T_flat_body.transform_point(0.65, 0.0, 0.15)
         lift_cmd = RobotCommandBuilder.arm_pose_command(
-            ax, ay, az,
-            hand_quat.w, hand_quat.x, hand_quat.y, hand_quat.z,
-            VISION_FRAME_NAME, 4.0,
+            ax,
+            ay,
+            az,
+            hand_quat.w,
+            hand_quat.x,
+            hand_quat.y,
+            hand_quat.z,
+            VISION_FRAME_NAME,
+            4.0,
         )
-        lift_id = cmd_client.robot_command(RobotCommandBuilder.build_synchro_command(lift_cmd))
+        lift_id = cmd_client.robot_command(
+            RobotCommandBuilder.build_synchro_command(lift_cmd)
+        )
         block_until_arm_arrives(cmd_client, lift_id, timeout_sec=5)
     except Exception:
         time.sleep(4)  # fallback wait if state read or arrival check fails
@@ -912,7 +965,8 @@ def run(vicon_client, robot, draw_speed: float = 1.0) -> None:
             if frame and frame.canvas and frame.canvas.is_valid():
                 print("  Computing auto-scale from canvas…")
                 scale = compute_scale(
-                    gcode_path, frame.canvas,
+                    gcode_path,
+                    frame.canvas,
                     margin=cfg["canvas_margin"],
                     arm_draw_x_m=cfg["arm_draw_x"],
                     arm_draw_y_m=cfg["arm_draw_y"],

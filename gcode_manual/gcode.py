@@ -526,8 +526,8 @@ def run(initial_gcode_file, test_only=False):
     scale = g.getfloat("scale", 0.001)
     min_dist_to_goal = g.getfloat("min_dist_to_goal", 0.03)
     allow_walking = g.getboolean("allow_walking", False)
-    velocity = g.getfloat("velocity", 0.15)
-    press_force_pct = g.getfloat("press_force_percent", -0.005)
+    velocity = g.getfloat("velocity", 0.08)
+    press_force_pct = g.getfloat("press_force_percent", -0.002)
     below_z_adm = g.getfloat("below_z_is_admittance", 0.0)
     travel_z = g.getfloat("travel_z", 0.05)
     draw_z_offset = g.getfloat("draw_z_offset", 0.005)
@@ -537,6 +537,8 @@ def run(initial_gcode_file, test_only=False):
     use_vision_frame = g.getboolean("use_vision_frame", True)
     use_xy_cross = g.getboolean("use_xy_to_z_cross_term", False)
     bias_force_x = g.getfloat("bias_force_x", 0.0)
+    touchdown_velocity = g.getfloat("touchdown_velocity", 0.02)
+    gripper_torque = g.getfloat("gripper_torque", 15.0)
 
     api_send_frame = VISION_FRAME_NAME if use_vision_frame else ODOM_FRAME_NAME
 
@@ -603,31 +605,38 @@ def run(initial_gcode_file, test_only=False):
             draw_z_offset,
         )
 
-        # ── Move arm to start position ────────────────────────────────────
+        # ── Two-phase arm positioning: safe height → hover above canvas ──────
+        # Phase 1: move arm forward at flat-body height so any lateral motion
+        # happens well above the front legs before descending toward the canvas.
         robot_state = state_client.get_robot_state()
-        flat_body_T_hand = SE3Pose(
-            0.75, 0, -0.35, math_helpers.Quat(w=0.707, x=0, y=0.707, z=0)
-        )
         (_, odom_T_flat_body, _, _, _, _) = get_transforms(False, robot_state)
-        odom_T_hand = odom_T_flat_body * flat_body_T_hand
-        p = odom_T_hand.to_proto()
+        hand_quat = math_helpers.Quat(w=0.707, x=0, y=0.707, z=0)
 
-        robot.logger.info("Moving arm to starting position…")
-        arm_cmd = RobotCommandBuilder.arm_pose_command(
-            p.position.x,
-            p.position.y,
-            p.position.z,
-            p.rotation.w,
-            p.rotation.x,
-            p.rotation.y,
-            p.rotation.z,
-            ODOM_FRAME_NAME,
-            0.000001,
+        p1 = (odom_T_flat_body * SE3Pose(0.65, 0, -0.05, hand_quat)).to_proto()
+        robot.logger.info("Phase 1 — arm to safe height before canvas approach…")
+        arm_cmd1 = RobotCommandBuilder.arm_pose_command(
+            p1.position.x, p1.position.y, p1.position.z,
+            p1.rotation.w, p1.rotation.x, p1.rotation.y, p1.rotation.z,
+            ODOM_FRAME_NAME, 4.0,
         )
-        cmd_id = cmd_client.robot_command(
-            RobotCommandBuilder.build_synchro_command(arm_cmd)
+        cmd_id1 = cmd_client.robot_command(
+            RobotCommandBuilder.build_synchro_command(arm_cmd1)
         )
-        block_until_arm_arrives(cmd_client, cmd_id)
+        block_until_arm_arrives(cmd_client, cmd_id1, timeout_sec=8.0)
+
+        # Phase 2: lower arm to canvas hover position (75cm forward, ~18cm above floor).
+        # Only Z changes here — no lateral sweep at low height.
+        p2 = (odom_T_flat_body * SE3Pose(0.75, 0, -0.35, hand_quat)).to_proto()
+        robot.logger.info("Phase 2 — lowering arm to canvas hover position…")
+        arm_cmd2 = RobotCommandBuilder.arm_pose_command(
+            p2.position.x, p2.position.y, p2.position.z,
+            p2.rotation.w, p2.rotation.x, p2.rotation.y, p2.rotation.z,
+            ODOM_FRAME_NAME, 4.0,
+        )
+        cmd_id2 = cmd_client.robot_command(
+            RobotCommandBuilder.build_synchro_command(arm_cmd2)
+        )
+        block_until_arm_arrives(cmd_client, cmd_id2, timeout_sec=8.0)
 
         # ── Confirm before touching down ──────────────────────────────────
         print()
@@ -656,7 +665,7 @@ def run(initial_gcode_file, test_only=False):
             [vision_T_tool],
             asc_client,
             cmd_client,
-            0.04,
+            touchdown_velocity,
             allow_walking,
             vision_T_admittance,
             press_force_pct,
@@ -830,6 +839,30 @@ def run(initial_gcode_file, test_only=False):
                     block_until_arm_arrives(cmd_client, lid, timeout_sec=5.0)
                     break
 
+                # Lift arm straight up before any lateral travel move.
+                # This prevents the arm from sweeping through the front legs
+                # while still at canvas height during draw→travel transitions.
+                if not is_admittance and last_admittance:
+                    snap = robot_state.kinematic_state.transforms_snapshot
+                    vt_wr1 = get_a_tform_b(snap, VISION_FRAME_NAME, WR1_FRAME_NAME)
+                    vt_tool = vt_wr1 * wr1_T_tool
+                    ep = vt_tool.to_proto()
+                    pre_travel = RobotCommandBuilder.arm_pose_command(
+                        ep.position.x,
+                        ep.position.y,
+                        touch_z + travel_z,
+                        ep.rotation.w,
+                        ep.rotation.x,
+                        ep.rotation.y,
+                        ep.rotation.z,
+                        VISION_FRAME_NAME,
+                        2.0,
+                    )
+                    pre_id = cmd_client.robot_command(
+                        RobotCommandBuilder.build_synchro_command(pre_travel)
+                    )
+                    block_until_arm_arrives(cmd_client, pre_id, timeout_sec=5.0)
+
                 move_arm(
                     robot_state,
                     is_admittance,
@@ -875,7 +908,7 @@ def run(initial_gcode_file, test_only=False):
         # ── Close gripper on taped marker ─────────────────────────────────
         robot.logger.info("Closing gripper on marker.")
         gripper_cmd = RobotCommandBuilder.claw_gripper_close_command()
-        gripper_cmd.synchronized_command.gripper_command.claw_gripper_command.maximum_torque.value = 15.0
+        gripper_cmd.synchronized_command.gripper_command.claw_gripper_command.maximum_torque.value = gripper_torque
         cmd_client.robot_command(gripper_cmd)
         time.sleep(1.0)
 
@@ -883,6 +916,12 @@ def run(initial_gcode_file, test_only=False):
         current_file = initial_gcode_file
         while True:
             _draw_file(current_file)
+
+            # Always stow before standing or showing menu — never leave the arm
+            # extended while the operator is near the robot.
+            robot.logger.info("Stowing arm…")
+            cmd_client.robot_command(RobotCommandBuilder.arm_stow_command())
+            time.sleep(4)
             blocking_stand(cmd_client, timeout_sec=10)
 
             print()
@@ -899,9 +938,7 @@ def run(initial_gcode_file, test_only=False):
                 break
 
         # ── Clean exit ────────────────────────────────────────────────────
-        robot.logger.info("Stowing arm and sitting…")
-        cmd_client.robot_command(RobotCommandBuilder.arm_stow_command())
-        time.sleep(2)
+        robot.logger.info("Sitting…")
         cmd_client.robot_command(RobotCommandBuilder.synchro_sit_command())
         time.sleep(2)
         robot.power_off(cut_immediately=False, timeout_sec=20)
